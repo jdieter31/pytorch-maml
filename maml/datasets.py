@@ -12,6 +12,14 @@ from maml.utils import ToTensor1D
 Benchmark = namedtuple('Benchmark', 'meta_train_dataset meta_val_dataset '
                                     'meta_test_dataset model loss_function')
 
+def batch_cross_entropy(inputs, target, weight=None, size_average=None,
+        ignore_index=-100, reduce=None, reduction='mean'):
+    loss = F.cross_entropy(inputs.reshape(-1, inputs.size(-1)), target.view(-1), weight, size_average, ignore_index, reduce, reduction)
+    if loss.ndim > 0:
+        return loss.reshape(inputs.size()[:-1])
+    else:
+        return loss
+
 def get_benchmark_by_name(name,
                           folder,
                           num_ways,
@@ -70,7 +78,7 @@ def get_benchmark_by_name(name,
                                      dataset_transform=dataset_transform)
 
         model = ModelConvOmniglot(num_ways, hidden_size=hidden_size)
-        loss_function = F.cross_entropy
+        loss_function = batch_cross_entropy
 
     elif name == 'miniimagenet':
         transform = Compose([Resize(84), ToTensor()])
@@ -96,7 +104,7 @@ def get_benchmark_by_name(name,
                                          dataset_transform=dataset_transform)
 
         model = ModelConvMiniImagenet(num_ways, hidden_size=hidden_size)
-        loss_function = F.cross_entropy
+        loss_function = batch_cross_entropy
 
     else:
         raise NotImplementedError('Unknown dataset `{0}`.'.format(name))

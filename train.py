@@ -9,11 +9,16 @@ from torchmeta.utils.data import BatchMetaDataLoader
 
 from maml.datasets import get_benchmark_by_name
 from maml.metalearners import ModelAgnosticMetaLearning
+from tqdm import tqdm
+from maml.utils import make_warp_model
+import wandb
 
 def main(args):
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
     device = torch.device('cuda' if args.use_cuda
                           and torch.cuda.is_available() else 'cpu')
+
+    wandb.init(project="geometric-meta-learning")
 
     if (args.output_folder is not None):
         if not os.path.exists(args.output_folder):
@@ -51,9 +56,15 @@ def main(args):
                                               num_workers=args.num_workers,
                                               pin_memory=True)
 
-    meta_optimizer = torch.optim.Adam(benchmark.model.parameters(), lr=args.meta_lr)
+    warp_model = None
+    if args.warp:
+        warp_model = make_warp_model(benchmark.model)
+        meta_optimizer = torch.optim.Adam(list(warp_model.parameters()) + list(benchmark.model.parameters()), lr=args.meta_lr)
+    else:
+        meta_optimizer = torch.optim.Adam(benchmark.model.parameters(), lr=args.meta_lr)
     metalearner = ModelAgnosticMetaLearning(benchmark.model,
                                             meta_optimizer,
+                                            warp_model=warp_model,
                                             first_order=args.first_order,
                                             num_adaptation_steps=args.num_steps,
                                             step_size=args.step_size,
@@ -64,7 +75,7 @@ def main(args):
 
     # Training loop
     epoch_desc = 'Epoch {{0: <{0}d}}'.format(1 + int(math.log10(args.num_epochs)))
-    for epoch in range(args.num_epochs):
+    for epoch in tqdm(range(args.num_epochs)):
         metalearner.train(meta_train_dataloader,
                           max_batches=args.num_batches,
                           verbose=args.verbose,
@@ -146,6 +157,7 @@ if __name__ == '__main__':
         help='Number of workers to use for data-loading (default: 1).')
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--use-cuda', action='store_true')
+    parser.add_argument('--warp', action='store_true')
 
     args = parser.parse_args()
 
