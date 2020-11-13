@@ -12,6 +12,94 @@ from maml.metalearners import ModelAgnosticMetaLearning
 from tqdm import tqdm
 from maml.utils import make_warp_model
 import wandb
+from torch.optim.lr_scheduler import LambdaLR
+
+def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
+    """
+    Create a schedule with a learning rate that decreases linearly from the initial lr set in the optimizer to 0,
+    after a warmup period during which it increases linearly from 0 to the initial lr set in the optimizer.
+
+    Args:
+        optimizer (:class:`~torch.optim.Optimizer`):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (:obj:`int`):
+            The number of steps for the warmup phase.
+        num_training_steps (:obj:`int`):
+            The total number of training steps.
+        last_epoch (:obj:`int`, `optional`, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Return:
+        :obj:`torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+    """
+
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        return max(
+            0.0, (float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))) # * (0.5 + 0.5 * math.cos(- math.pi + 2 * math.pi * current_step / wavelength))
+        )
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
+def get_cosine_schedule(optimizer, wavelength=100, last_epoch=-1):
+    """
+    Create a schedule with a learning rate that decreases linearly from the initial lr set in the optimizer to 0,
+    after a warmup period during which it increases linearly from 0 to the initial lr set in the optimizer.
+
+    Args:
+        optimizer (:class:`~torch.optim.Optimizer`):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (:obj:`int`):
+            The number of steps for the warmup phase.
+        num_training_steps (:obj:`int`):
+            The total number of training steps.
+        last_epoch (:obj:`int`, `optional`, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Return:
+        :obj:`torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+    """
+
+    def lr_lambda(current_step: int):
+        return max(0.0, (0.5 + 0.5 * math.cos(2 * math.pi * current_step / wavelength)))
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+def get_cosine_with_hard_restarts_schedule_with_warmup(
+    optimizer, num_warmup_steps: int, num_training_steps: int, num_cycles: int = 1, last_epoch: int = -1
+):
+    """
+    Create a schedule with a learning rate that decreases following the values of the cosine function between the
+    initial lr set in the optimizer to 0, with several hard restarts, after a warmup period during which it increases
+    linearly between 0 and the initial lr set in the optimizer.
+
+    Args:
+        optimizer (:class:`~torch.optim.Optimizer`):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (:obj:`int`):
+            The number of steps for the warmup phase.
+        num_training_steps (:obj:`int`):
+            The total number of training steps.
+        num_cycles (:obj:`int`, `optional`, defaults to 1):
+            The number of hard restarts to use.
+        last_epoch (:obj:`int`, `optional`, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Return:
+        :obj:`torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+    """
+
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        if progress >= 1.0:
+            return 0.0
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * ((float(num_cycles) * progress) % 1.0))))
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 def main(args):
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
@@ -43,7 +131,8 @@ def main(args):
                                       args.num_ways,
                                       args.num_shots,
                                       args.num_shots_test,
-                                      hidden_size=args.hidden_size)
+                                      hidden_size=args.hidden_size,
+                                      meta_batch_size=args.batch_size)
 
     meta_train_dataloader = BatchMetaDataLoader(benchmark.meta_train_dataset,
                                                 batch_size=args.batch_size,
@@ -59,17 +148,30 @@ def main(args):
     warp_model = None
     if args.warp:
         warp_model = make_warp_model(benchmark.model)
-        meta_optimizer = torch.optim.Adam(list(warp_model.parameters()) + list(benchmark.model.parameters()), lr=args.meta_lr)
+        meta_optimizer = torch.optim.Adam(benchmark.model.parameters(), lr=args.meta_lr)
+        warp_meta_optimizer = torch.optim.Adam(warp_model.parameters(), lr=args.warp_lr)
+
+        #warp_meta_optimizer = None
+        #meta_optimizer = torch.optim.Adam(warp_model.parameters(), lr=args.warp_lr)
     else:
         meta_optimizer = torch.optim.Adam(benchmark.model.parameters(), lr=args.meta_lr)
+        warp_meta_optimizer = None
+
+    warp_scheduler = get_linear_schedule_with_warmup(warp_meta_optimizer, 500, 100000, last_epoch=-1)
+    scheduler = get_linear_schedule_with_warmup(meta_optimizer, 500, 100000, last_epoch=-1)
+
     metalearner = ModelAgnosticMetaLearning(benchmark.model,
                                             meta_optimizer,
+                                            scheduler=scheduler,
+                                            warp_optimizer=warp_meta_optimizer,
                                             warp_model=warp_model,
+                                            warp_scheduler=warp_scheduler,
                                             first_order=args.first_order,
                                             num_adaptation_steps=args.num_steps,
                                             step_size=args.step_size,
                                             loss_function=benchmark.loss_function,
-                                            device=device)
+                                            device=device,
+                                            num_maml_steps=args.num_maml_steps)
 
     best_value = None
 
@@ -82,7 +184,7 @@ def main(args):
                           desc='Training',
                           leave=False)
         results = metalearner.evaluate(meta_val_dataloader,
-                                       max_batches=args.num_batches,
+                                       max_batches=args.num_eval_batches,
                                        verbose=args.verbose,
                                        desc=epoch_desc.format(epoch + 1))
 
@@ -138,19 +240,26 @@ if __name__ == '__main__':
     parser.add_argument('--num-steps', type=int, default=1,
         help='Number of fast adaptation steps, ie. gradient descent '
         'updates (default: 1).')
-    parser.add_argument('--num-epochs', type=int, default=50,
+    parser.add_argument('--num-epochs', type=int, default=200,
         help='Number of epochs of meta-training (default: 50).')
-    parser.add_argument('--num-batches', type=int, default=100,
+    parser.add_argument('--num-batches', type=int, default=500,
         help='Number of batch of tasks per epoch (default: 100).')
+    parser.add_argument('--num-eval-batches', type=int, default=100)
     parser.add_argument('--step-size', type=float, default=0.1,
         help='Size of the fast adaptation step, ie. learning rate in the '
         'gradient descent update (default: 0.1).')
     parser.add_argument('--first-order', action='store_true',
         help='Use the first order approximation, do not use higher-order '
         'derivatives during meta-optimization.')
-    parser.add_argument('--meta-lr', type=float, default=0.001,
+    parser.add_argument('--meta-lr', type=float, default=0.0001,
         help='Learning rate for the meta-optimizer (optimization of the outer '
-        'loss). The default optimizer is Adam (default: 1e-3).')
+        'loss). The default optimizer is Adam (default: 1e-4).')
+    parser.add_argument('--warp-lr', type=float, default=0.00001,
+        help='Learning rate for the meta-optimizer (optimization of the outer '
+        'loss). The default optimizer is Adam (default: 1e-5).')
+    parser.add_argument('--num-maml-steps', type=int, default=0,
+        help='Number of steps to update initialization for before freezing it')
+    parser.add_argument
 
     # Misc
     parser.add_argument('--num-workers', type=int, default=1,

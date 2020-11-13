@@ -25,7 +25,9 @@ def get_benchmark_by_name(name,
                           num_ways,
                           num_shots,
                           num_shots_test,
-                          hidden_size=None):
+                          hidden_size=None,
+                          meta_batch_size=1
+                          ):
     dataset_transform = ClassSplitter(shuffle=True,
                                       num_train_per_class=num_shots,
                                       num_test_per_class=num_shots_test)
@@ -48,7 +50,7 @@ def get_benchmark_by_name(name,
                                      target_transform=transform,
                                      dataset_transform=dataset_transform)
 
-        model = ModelMLPSinusoid(hidden_sizes=[40, 40])
+        model = ModelMLPSinusoid(hidden_sizes=[40, 40], meta_batch_size=meta_batch_size)
         loss_function = F.mse_loss
 
     elif name == 'omniglot':
@@ -77,7 +79,7 @@ def get_benchmark_by_name(name,
                                      meta_test=True,
                                      dataset_transform=dataset_transform)
 
-        model = ModelConvOmniglot(num_ways, hidden_size=hidden_size)
+        model = ModelConvOmniglot(num_ways, hidden_size=hidden_size, meta_batch_size=meta_batch_size)
         loss_function = batch_cross_entropy
 
     elif name == 'miniimagenet':
@@ -103,7 +105,7 @@ def get_benchmark_by_name(name,
                                          meta_test=True,
                                          dataset_transform=dataset_transform)
 
-        model = ModelConvMiniImagenet(num_ways, hidden_size=hidden_size)
+        model = ModelConvMiniImagenet(num_ways, hidden_size=hidden_size, meta_batch_size=meta_batch_size)
         loss_function = batch_cross_entropy
 
     else:

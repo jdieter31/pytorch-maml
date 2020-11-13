@@ -2,7 +2,7 @@ import torch
 
 from collections import OrderedDict
 from torchmeta.modules import MetaModule
-from .model import BatchLinear
+from .model import BatchLinear, ExpandingLinear
 from .transformer_metric import TransformerMetric
 
 from .expm import torch_expm as expm
@@ -10,8 +10,12 @@ from .expm import torch_expm as expm
 def compute_accuracy(logits, targets):
     """Compute the accuracy"""
     with torch.no_grad():
-        _, predictions = torch.max(logits, dim=2)
-        accuracy = torch.mean(predictions.eq(targets).float(), dim=-1)
+        if logits.dim() == 2:
+            _, predictions = torch.max(logits, dim=1)
+            accuracy = torch.mean(predictions.eq(targets).float())
+        else:
+            _, predictions = torch.max(logits, dim=2)
+            accuracy = torch.mean(predictions.eq(targets).float(), dim=-1)
     return accuracy.detach().cpu().numpy()
 
 def tensors_to_device(tensors, device=torch.device('cpu')):
@@ -42,7 +46,7 @@ class ToTensor1D(object):
 def make_warp_model(model):
     metric_params = []
     for layer in model.modules():
-        if isinstance(layer, BatchLinear):
+        if isinstance(layer, BatchLinear) or isinstance(layer, ExpandingLinear):
             metric_params.append(layer.weight)
 
     return TransformerMetric(metric_params)
@@ -77,7 +81,8 @@ def gradient_update_parameters_warp(model,
                                params=None,
                                warp_model=None,
                                step_size=0.5,
-                               first_order=False):
+                               first_order=False,
+                               state=None):
     """Update of the meta-parameters with one step of gradient descent on the
     loss function.
     Parameters
@@ -109,12 +114,10 @@ def gradient_update_parameters_warp(model,
     if params is None:
         params = OrderedDict(model.meta_named_parameters())
 
-
     param_jacobs_lst = [[] for _ in range(len(params))]
     for i in range(loss.size(0)):
         grads = torch.autograd.grad(loss[i], params.values(), retain_graph=True, create_graph=not first_order)
         for j, grad in enumerate(grads):
-            #param_jacobs[j][:, i, :, :] += grad
             param_jacobs_lst[j].append(grad)
 
     param_jacobs = [torch.stack(param_jacob, dim=1) for param_jacob in param_jacobs_lst]
@@ -122,9 +125,9 @@ def gradient_update_parameters_warp(model,
     if warp_model is not None:
         warp_model_input = []
         for param in warp_model.warp_parameters:
-            warp_model_input.append([param.input_data.detach(), param.grad_data.detach()])
+            warp_model_input.append([param.input_data, param.grad_data])
 
-        kronecker_matrix_logs = warp_model(warp_model_input)
+        kronecker_matrix_logs, state = warp_model(warp_model_input, state=state)
         kronecker_matrices = []
 
         for matrix_a, matrix_b in kronecker_matrix_logs:
@@ -157,4 +160,4 @@ def gradient_update_parameters_warp(model,
                 grad = kronecker_warp(grad, kronecker_matrices[i])
             updated_params[name] = param - step_size * grad.mean(dim=-3)
 
-    return updated_params
+    return updated_params, state

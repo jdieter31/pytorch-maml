@@ -8,6 +8,7 @@ from collections import OrderedDict
 from torchmeta.utils import gradient_update_parameters
 from maml.utils import tensors_to_device, compute_accuracy, gradient_update_parameters_warp
 from maml.model import ExpandingParameter
+from ..model import BatchLinear
 
 __all__ = ['ModelAgnosticMetaLearning', 'MAML', 'FOMAML']
 
@@ -54,19 +55,23 @@ class ModelAgnosticMetaLearning(object):
            International Conference on Learning Representations (ICLR).
            (https://arxiv.org/abs/1810.09502)
     """
-    def __init__(self, model, optimizer=None, warp_model=None, step_size=0.1, first_order=False,
+    def __init__(self, model, optimizer=None, warp_optimizer=None, warp_model=None, step_size=0.1, first_order=False,
                  learn_step_size=False, per_param_step_size=False,
-                 num_adaptation_steps=1, scheduler=None,
-                 loss_function=F.cross_entropy, device=None):
+                 num_adaptation_steps=1, scheduler=None, warp_scheduler=None,
+                 loss_function=F.cross_entropy, device=None, num_maml_steps=0):
         self.model = model.to(device=device)
         self.warp_model = warp_model.to(device=device) if warp_model is not None else None
         self.optimizer = optimizer
+        self.warp_optimizer = warp_optimizer
         self.step_size = step_size
         self.first_order = first_order
         self.num_adaptation_steps = num_adaptation_steps
         self.scheduler = scheduler
+        self.warp_scheduler = warp_scheduler
         self.loss_function = loss_function
         self.device = device
+        self.num_maml_steps = num_maml_steps
+        self.num_steps = 0
 
         if per_param_step_size:
             self.step_size = OrderedDict((name, torch.tensor(step_size,
@@ -86,7 +91,7 @@ class ModelAgnosticMetaLearning(object):
                 self.scheduler.base_lrs([group['initial_lr']
                     for group in self.optimizer.param_groups])
 
-    def get_outer_loss(self, batch):
+    def get_outer_loss(self, batch, eval_mode=False):
         if 'test' not in batch:
             raise RuntimeError('The batch does not contain any test dataset.')
 
@@ -113,27 +118,54 @@ class ModelAgnosticMetaLearning(object):
         test_inputs = batch["test"][0]
         test_targets = batch["test"][1]
 
-        params, adaptation_results = self.adapt(train_inputs, train_targets,
-            is_classification_task=is_classification_task,
-            num_adaptation_steps=self.num_adaptation_steps,
-            step_size=self.step_size, first_order=self.first_order)
+        if eval_mode:
+            for i in range(train_inputs.size(0)):
+                train_input_exp = train_inputs[i].unsqueeze(0).expand(train_inputs.size(0), *list(train_inputs.size())[1:]).contiguous()
+                train_target_exp = train_targets[i].unsqueeze(0).expand(train_targets.size(0), *list(train_targets.size())[1:]).contiguous()
+                test_input_exp = test_inputs[i].unsqueeze(0).expand(test_inputs.size(0), *list(test_inputs.size())[1:]).contiguous()
 
-        #results['inner_losses'][:] = adaptation_results['inner_losses']
-        if is_classification_task:
-            results['accuracies_before'] = adaptation_results['accuracy_before']
+                params, adaptation_results = self.adapt(train_input_exp, train_target_exp,
+                    is_classification_task=is_classification_task,
+                    num_adaptation_steps=self.num_adaptation_steps,
+                    step_size=self.step_size, first_order=self.first_order)
 
-        with torch.set_grad_enabled(self.model.training):
-            test_logits = self.model(test_inputs, params=params)
-            outer_loss = self.loss_function(test_logits, test_targets)
-            results['outer_losses'] = outer_loss.item()
-            mean_outer_loss += outer_loss
+                with torch.set_grad_enabled(False):
+                    test_logits = self.model(test_input_exp, params=params)
+                    softmax = torch.nn.functional.softmax(test_logits, dim=-1)
+                    softmax = softmax.mean(dim=0)
+                    test_logits = torch.log(softmax)
+                    outer_loss = self.loss_function(test_logits, test_targets[i])
+                    mean_outer_loss += outer_loss
 
-        if is_classification_task:
-            results['accuracies_after'] = compute_accuracy(
-                test_logits, test_targets)
+                if is_classification_task:
+                    results['accuracies_after'][i] = compute_accuracy(
+                        test_logits, test_targets[i])
 
-        mean_outer_loss.div_(num_tasks)
-        results['mean_outer_loss'] = mean_outer_loss.item()
+                torch.cuda.empty_cache()
+
+            mean_outer_loss.div_(num_tasks)
+            results['mean_outer_loss'] = mean_outer_loss.item()
+        else:
+            params, adaptation_results = self.adapt(train_inputs, train_targets,
+                is_classification_task=is_classification_task,
+                num_adaptation_steps=self.num_adaptation_steps,
+                step_size=self.step_size, first_order=self.first_order)
+
+            #results['inner_losses'][:] = adaptation_results['inner_losses']
+            if is_classification_task:
+                results['accuracies_before'] = adaptation_results['accuracy_before']
+
+            with torch.set_grad_enabled(self.model.training):
+                test_logits = self.model(test_inputs, params=params)
+                outer_loss = self.loss_function(test_logits, test_targets)
+                mean_outer_loss += outer_loss
+
+            if is_classification_task:
+                results['accuracies_after'] = compute_accuracy(
+                    test_logits, test_targets)
+
+            mean_outer_loss.div_(num_tasks)
+            results['mean_outer_loss'] = mean_outer_loss.item()
 
         return mean_outer_loss, results
 
@@ -150,6 +182,7 @@ class ModelAgnosticMetaLearning(object):
 
         results = {}
 
+        state = None
         for step in range(num_adaptation_steps):
             if self.warp_model is not None:
                 self.warp_model.set_listening(True)
@@ -166,9 +199,9 @@ class ModelAgnosticMetaLearning(object):
                 results['accuracy_before'] = compute_accuracy(logits, targets)
 
             self.model.zero_grad()
-            params = gradient_update_parameters_warp(self.model, inner_loss,
+            params, state = gradient_update_parameters_warp(self.model, inner_loss,
                 warp_model=self.warp_model, step_size=step_size, params=params,
-                first_order=(not self.model.training) or first_order)
+                first_order=(not self.model.training) or first_order, state=state)
 
             if self.warp_model is not None:
                 self.warp_model.set_listening(False)
@@ -179,6 +212,7 @@ class ModelAgnosticMetaLearning(object):
         with tqdm(total=max_batches, disable=not verbose, **kwargs) as pbar:
             for results in self.train_iter(dataloader, max_batches=max_batches):
                 pbar.update(1)
+                self.num_steps = 0
                 postfix = {'loss': '{0:.4f}'.format(results['mean_outer_loss'])}
                 wandb_data = {'outer_loss': results['mean_outer_loss']}
                 if 'accuracies_after' in results:
@@ -197,22 +231,52 @@ class ModelAgnosticMetaLearning(object):
                 'parameters(), lr=0.01), ...).'.format(__class__.__name__))
         num_batches = 0
         self.model.train()
+        if self.warp_model is not None:
+            self.warp_model.train()
         while num_batches < max_batches:
             for batch in dataloader:
                 if num_batches >= max_batches:
                     break
 
-                if self.scheduler is not None:
-                    self.scheduler.step(epoch=num_batches)
+                self.num_steps += 1
 
                 self.optimizer.zero_grad()
+                if self.warp_optimizer is not None:
+                    self.warp_optimizer.zero_grad()
 
                 batch = tensors_to_device(batch, device=self.device)
                 outer_loss, results = self.get_outer_loss(batch)
                 yield results
 
                 outer_loss.backward()
-                self.optimizer.step()
+
+
+                if self.num_maml_steps <= 0 or self.num_steps < self.num_maml_steps:
+                    self.optimizer.step()
+
+                if self.warp_optimizer is not None:
+                    self.warp_optimizer.step()
+
+                for param_group in self.optimizer.param_groups:
+                    wandb.log({"maml_lr": param_group['lr']}, commit=False)
+                    break
+
+                if self.warp_optimizer is not None:
+                    for param_group in self.warp_optimizer.param_groups:
+                        wandb.log({"warp_lr": param_group['lr']}, commit=False)
+                        break
+
+                if self.scheduler is not None:
+                    self.scheduler.step()
+
+                if self.warp_scheduler is not None:
+                    self.warp_scheduler.step()
+
+                """
+                for module in self.model.modules():
+                    if isinstance(module, BatchLinear):
+                        module.reset_parameters()
+                """
 
                 num_batches += 1
 
@@ -235,18 +299,26 @@ class ModelAgnosticMetaLearning(object):
         if 'accuracies_after' in results:
             mean_results['accuracies_after'] = mean_accuracy
 
+        wandb_data = {
+            "mean_outer_loss_eval": mean_outer_loss,
+            "mean_accuracy_eval": mean_accuracy
+        }
+        wandb.log(wandb_data, commit=False)
+
         return mean_results
 
     def evaluate_iter(self, dataloader, max_batches=500):
         num_batches = 0
         self.model.eval()
+        if self.warp_model is not None:
+            self.warp_model.eval()
         while num_batches < max_batches:
             for batch in dataloader:
                 if num_batches >= max_batches:
                     break
 
                 batch = tensors_to_device(batch, device=self.device)
-                _, results = self.get_outer_loss(batch)
+                _, results = self.get_outer_loss(batch, eval_mode=True)
                 yield results
 
                 num_batches += 1
