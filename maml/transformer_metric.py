@@ -2,7 +2,6 @@ import torch
 from torch import nn
 from typing import List
 from math import sqrt, ceil
-from .model import ExpandingParameter
 from torch.nn.init import orthogonal_
 from torch.nn.modules.normalization import LayerNorm
 
@@ -31,7 +30,7 @@ class MiniConvBlock(nn.Module):
 
 class TransformerMetric(nn.Module):
 
-    def __init__(self, warp_parameters, hidden_size: int = 512, transformer_layers: int = 4, transformer_heads: int = 8, transformer_feedforward_dim: int = 2048, transformer_d_model: int = 512, transformer_cascade_direction: str = "bidirectional", num_outer_products = 32, conv_hidden_dim: int = 2048):
+    def __init__(self, warp_parameters, hidden_size: int = 256, transformer_layers: int = 3, transformer_heads: int = 8, transformer_feedforward_dim: int = 1024, transformer_d_model: int = 256, transformer_cascade_direction: str = "bidirectional", num_outer_products = 16, conv_hidden_dim: int = 2048):
 
         super(TransformerMetric, self).__init__()
 
@@ -129,40 +128,79 @@ class TransformerMetric(nn.Module):
 
         self.output_heads = []
         for param in warp_parameters:
-            self.output_heads.append(
-                [
-                    nn.Linear(self.transformer_d_model,
-                            self.num_outer_products *
-                            param.size(1)),
-                    nn.Linear(self.transformer_d_model,
-                              self.num_outer_products),
-                    nn.Linear(self.transformer_d_model,
-                            self.num_outer_products *
-                            param.size(2)),
-                    nn.Linear(self.transformer_d_model,
-                              self.num_outer_products),
-                    nn.Linear(self.transformer_d_model,
-                              1),
-                    nn.Linear(self.transformer_d_model,
-                              1)
-                ]
-            )
+            if param.convolutional:
+                self.output_heads.append(
+                    [
+                        nn.Linear(self.transformer_d_model,
+                                self.num_outer_products *
+                                param.size(1)),
+                        #nn.Linear(self.transformer_d_model,
+                        #          self.num_outer_products),
+                        nn.Linear(self.transformer_d_model,
+                                self.num_outer_products *
+                                param.size(2) // param.kernel_size),
 
-            # Initialize to be sufficiently small to be suitable for matrix
-            # exponential
-            with torch.no_grad():
-                self.output_heads[-1][0].weight /= param.size(1) * param.size(2)
-                self.output_heads[-1][2].weight /= param.size(1) * param.size(2)
-                orthogonal_(self.output_heads[-1][0].bias.view(
-                    self.num_outer_products, param.size(1)))
-                orthogonal_(self.output_heads[-1][2].bias.view(
-                    self.num_outer_products, param.size(2)))
+                        nn.Linear(self.transformer_d_model,
+                                self.num_outer_products *
+                                  param.kernel_size),
+                        #nn.Linear(self.transformer_d_model,
+                        #          self.num_outer_products),
+                        nn.Linear(self.transformer_d_model,
+                                  1),
+                        nn.Linear(self.transformer_d_model,
+                                  1),
+                        nn.Linear(self.transformer_d_model,
+                                  1)
+                    ]
+                )
+
+                # Initialize to be sufficiently small to be suitable for matrix
+                # exponential
+                with torch.no_grad():
+                    self.output_heads[-1][0].weight /= param.size(1) * param.size(2)
+                    self.output_heads[-1][1].weight /= param.size(1) * param.size(2)
+                    self.output_heads[-1][2].weight /= param.size(1) * param.size(2)
+                    orthogonal_(self.output_heads[-1][0].bias.view(
+                        self.num_outer_products, param.size(1)))
+                    orthogonal_(self.output_heads[-1][1].bias.view(
+                        self.num_outer_products, param.size(2) // param.kernel_size))
+                    orthogonal_(self.output_heads[-1][2].bias.view(
+                        self.num_outer_products, param.kernel_size))
+            else:
+                self.output_heads.append(
+                    [
+                        nn.Linear(self.transformer_d_model,
+                                self.num_outer_products *
+                                param.size(1)),
+                        #nn.Linear(self.transformer_d_model,
+                        #          self.num_outer_products),
+                        nn.Linear(self.transformer_d_model,
+                                self.num_outer_products *
+                                param.size(2)),
+                        #nn.Linear(self.transformer_d_model,
+                        #          self.num_outer_products),
+                        nn.Linear(self.transformer_d_model,
+                                  1),
+                        nn.Linear(self.transformer_d_model,
+                                  1)
+                    ]
+                )
+
+                # Initialize to be sufficiently small to be suitable for matrix
+                # exponential
+                with torch.no_grad():
+                    self.output_heads[-1][0].weight /= param.size(1) * param.size(2)
+                    self.output_heads[-1][1].weight /= param.size(1) * param.size(2)
+                    orthogonal_(self.output_heads[-1][0].bias.view(
+                        self.num_outer_products, param.size(1)))
+                    orthogonal_(self.output_heads[-1][1].bias.view(
+                        self.num_outer_products, param.size(2)))
 
                 # Don't make scalars too big
-                self.output_heads[-1][1].weight /= self.num_outer_products
-                self.output_heads[-1][1].bias /= self.num_outer_products
-                self.output_heads[-1][3].weight /= self.num_outer_products
-                self.output_heads[-1][3].bias /= self.num_outer_products
+                # self.output_heads[-1][1].weight /= self.num_outer_products
+                # self.output_heads[-1][1].bias /= self.num_outer_products
+                # self.output_heads[-1][3].weight /= self.num_outer_products
+                # self.output_heads[-1][3].bias /= self.num_outer_products
         self.output_heads = nn.ModuleList([nn.ModuleList(output_head) for output_head in self.output_heads])
 
     def forward(self, warp_inputs: List[List[torch.Tensor]], state: List[List[torch.Tensor]] = None):
@@ -241,26 +279,31 @@ class TransformerMetric(nn.Module):
                 embeddings = backward_transformer_out.transpose(1,2)
 
             for j in range(len(embeddings)):
-                embeddings[i][j] = self.layer_norms[i][j](embeddings[i][j])
+                embeddings[j][i] = self.layer_norms[i][j](embeddings[j][i])
 
         output_matrices = []
         for i, (embedding, param) in enumerate(zip(embeddings,
                                                    self.warp_parameters)):
             matrix_b_gen = self.output_heads[i][0](embedding)
-            matrix_b_scalar = self.output_heads[i][1](embedding)
-            matrix_a_gen = self.output_heads[i][2](embedding)
-            matrix_a_scalar = self.output_heads[i][3](embedding)
+            #matrix_b_scalar = self.output_heads[i][1](embedding)
+            matrix_a_gen = self.output_heads[i][1](embedding)
 
-            matrix_b_eye = self.output_heads[i][4](embedding)
-            matrix_a_eye = self.output_heads[i][5](embedding)
+            if len(self.output_heads[i]) > 4:
+                matrix_c_gen = self.output_heads[i][2](embedding)
+
+                matrix_b_eye = self.output_heads[i][3](embedding)
+                matrix_a_eye = self.output_heads[i][4](embedding)
+            else:
+                matrix_b_eye = self.output_heads[i][2](embedding)
+                matrix_a_eye = self.output_heads[i][3](embedding)
 
             original_shape_b = matrix_b_gen.size()
             new_shape_b = [-1, param.size(1)]
             matrix_b_gen = matrix_b_gen.reshape(new_shape_b)
-            matrix_b_scalar = matrix_b_scalar.reshape([-1,1])
+            # matrix_b_scalar = matrix_b_scalar.reshape([-1,1])
 
             # Get scalars times outer products
-            matrix_b = torch.bmm(matrix_b_scalar.unsqueeze(-1) * \
+            matrix_b = torch.bmm(# matrix_b_scalar.unsqueeze(-1) * \
                                  matrix_b_gen.unsqueeze(-1),
                                  matrix_b_gen.unsqueeze(-2))
             matrix_b = matrix_b.reshape(list(original_shape_b)[:-1] +
@@ -272,21 +315,50 @@ class TransformerMetric(nn.Module):
                             ).unsqueeze(0).unsqueeze(0).expand_as(matrix_b)
 
             original_shape_a = matrix_a_gen.size()
-            new_shape_a = [-1, param.size(2)]
+            if len(self.output_heads[i]) > 4:
+                new_shape_a = [-1, param.size(2) // param.kernel_size]
+            else:
+                new_shape_a = [-1, param.size(2)]
             matrix_a_gen = matrix_a_gen.reshape(new_shape_a)
-            matrix_a_scalar = matrix_a_scalar.reshape([-1,1])
-            matrix_a = torch.bmm(matrix_a_scalar.unsqueeze(-1) * \
+            # matrix_a_scalar = matrix_a_scalar.reshape([-1,1])
+            matrix_a = torch.bmm(# matrix_a_scalar.unsqueeze(-1) * \
                                  matrix_a_gen.unsqueeze(-1),
                                  matrix_a_gen.unsqueeze(-2))
-            matrix_a = matrix_a.reshape(list(original_shape_a)[:-1] +
-                             [self.num_outer_products] + 2 * [param.size(2)])
+            if len(self.output_heads[i]) > 4:
+                matrix_a = matrix_a.reshape(list(original_shape_a)[:-1] +
+                                [self.num_outer_products] + 2 * [param.size(2) // param.kernel_size])
+            else:
+                matrix_a = matrix_a.reshape(list(original_shape_a)[:-1] +
+                                [self.num_outer_products] + 2 * [param.size(2)])
             matrix_a = matrix_a.sum(dim=-3)
 
             matrix_a += matrix_a_eye.unsqueeze(-1) * \
                     torch.eye(matrix_a.size(-1), device=matrix_a.device
                             ).unsqueeze(0).unsqueeze(0).expand_as(matrix_a)
+            if len(self.output_heads[i]) > 4:
+                original_shape_c = matrix_c_gen.size()
+                new_shape_c = [-1, param.kernel_size]
+                matrix_c_gen = matrix_c_gen.reshape(new_shape_c)
 
-            output_matrices.append([matrix_a, matrix_b])
+                matrix_c_eye = self.output_heads[i][5](embedding)
+                # matrix_c_scalar = matrix_c_scalar.reshape([-1,1])
+
+                # Get scalars times outer products
+                matrix_c = torch.bmm(# matrix_c_scalar.unsqueeze(-1) * \
+                                    matrix_c_gen.unsqueeze(-1),
+                                    matrix_c_gen.unsqueeze(-2))
+                matrix_c = matrix_c.reshape(list(original_shape_c)[:-1] +
+                                [self.num_outer_products] + 2 * [param.kernel_size])
+                matrix_c = matrix_c.sum(dim=-3)
+
+                matrix_c += matrix_c_eye.unsqueeze(-1) * \
+                        torch.eye(matrix_c.size(-1), device=matrix_c.device
+                                ).unsqueeze(0).unsqueeze(0).expand_as(matrix_c)
+
+                output_matrices.append([matrix_a, matrix_b, matrix_c])
+
+            else:
+                output_matrices.append([matrix_a, matrix_b])
 
         return output_matrices, state
 

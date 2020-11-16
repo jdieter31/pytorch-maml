@@ -2,7 +2,7 @@ import torch
 
 from collections import OrderedDict
 from torchmeta.modules import MetaModule
-from .model import BatchLinear, ExpandingLinear
+from .model import BatchLinear
 from .transformer_metric import TransformerMetric
 
 from .expm import torch_expm as expm
@@ -46,7 +46,7 @@ class ToTensor1D(object):
 def make_warp_model(model):
     metric_params = []
     for layer in model.modules():
-        if isinstance(layer, BatchLinear) or isinstance(layer, ExpandingLinear):
+        if isinstance(layer, BatchLinear):
             metric_params.append(layer.weight)
 
     return TransformerMetric(metric_params)
@@ -68,13 +68,29 @@ def kronecker_warp(grad, kronecker_matrices) -> torch.Tensor:
     matrix_a = matrix_a.view(-1, matrix_a.size(-2), matrix_a.size(-1))
     matrix_b = kronecker_matrices[1]
     matrix_b = matrix_b.view(-1, matrix_b.size(-2), matrix_b.size(-1))
-    grad_shape = grad.size()
-    grad = grad.view(-1, grad.size(-2), grad.size(-1))
+    if len(kronecker_matrices) > 2:
+        matrix_c = kronecker_matrices[2]
+        matrix_c = matrix_c.view(-1, matrix_c.size(-2), matrix_c.size(-1))
 
-    prod1 = torch.bmm(matrix_b, grad)
-    prod2 = torch.bmm(prod1, torch.transpose(matrix_a, 1, 2))
+        grad_size = grad.size()
+        grad = grad.view(-1, matrix_a.size(-1), matrix_c.size(-1))
 
-    return prod2.view(grad_shape)
+        matrix_a = matrix_a.unsqueeze(1).expand(matrix_a.size(0), grad_size[-2], *matrix_a.size()[1:]).reshape(-1, matrix_a.size(-2), matrix_a.size(-1))
+        matrix_c = matrix_c.unsqueeze(1).expand(matrix_c.size(0), grad_size[-2], *matrix_c.size()[1:]).reshape(-1, matrix_c.size(-2), matrix_c.size(-1))
+        prod1 = torch.bmm(matrix_a.transpose(1, 2), grad)
+        prod2 = torch.bmm(prod1, matrix_c)
+
+        temp = prod2.view(-1, matrix_b.size(-1), grad_size[-1])
+        prod3 = torch.bmm(matrix_b, temp)
+        return prod3.view(grad_size)
+    else:
+        grad_shape = grad.size()
+        grad = grad.view(-1, grad.size(-2), grad.size(-1))
+
+        prod1 = torch.bmm(matrix_b, grad)
+        prod2 = torch.bmm(prod1, torch.transpose(matrix_a, 1, 2))
+
+        return prod2.view(grad_shape)
 
 def gradient_update_parameters_warp(model,
                                loss,
@@ -130,20 +146,30 @@ def gradient_update_parameters_warp(model,
         kronecker_matrix_logs, state = warp_model(warp_model_input, state=state)
         kronecker_matrices = []
 
-        for matrix_a, matrix_b in kronecker_matrix_logs:
+        #for matrix_a, matrix_b in kronecker_matrix_logs:
+        for kronecker_matrix_list in kronecker_matrix_logs:
+            matrix_a = kronecker_matrix_list[0]
+            matrix_b = kronecker_matrix_list[1]
+            if len(kronecker_matrix_list) > 2:
+                matrix_c = kronecker_matrix_list[2]
+
             # Negative because we want metric inverse
-            exp_matrix_a = expm(-matrix_a.reshape((-1, matrix_a.size(-2),
+            exp_matrix_a = torch.matrix_exp(-matrix_a.reshape((-1, matrix_a.size(-2),
                                                    matrix_a.size(-1))))
             exp_matrix_a = exp_matrix_a.reshape(matrix_a.size())
 
-            exp_matrix_b = expm(-matrix_b.reshape((-1, matrix_b.size(-2),
+            exp_matrix_b = torch.matrix_exp(-matrix_b.reshape((-1, matrix_b.size(-2),
                                                    matrix_b.size(-1))))
             exp_matrix_b = exp_matrix_b.reshape(matrix_b.size())
 
-            exp_matrix_a.requires_grad_(True)
-            exp_matrix_b.requires_grad_(True)
+            if len(kronecker_matrix_list) > 2:
+                exp_matrix_c = torch.matrix_exp(-matrix_c.reshape((-1, matrix_c.size(-2),
+                                                    matrix_c.size(-1))))
+                exp_matrix_c = exp_matrix_c.reshape(matrix_c.size())
 
-            kronecker_matrices.append([exp_matrix_a, exp_matrix_b])
+                kronecker_matrices.append([exp_matrix_a, exp_matrix_b, exp_matrix_c])
+            else:
+                kronecker_matrices.append([exp_matrix_a, exp_matrix_b])
 
 
     updated_params = OrderedDict()

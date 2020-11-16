@@ -7,8 +7,7 @@ from tqdm import tqdm
 from collections import OrderedDict
 from torchmeta.utils import gradient_update_parameters
 from maml.utils import tensors_to_device, compute_accuracy, gradient_update_parameters_warp
-from maml.model import ExpandingParameter
-from ..model import BatchLinear
+from ..model import BatchParameter
 
 __all__ = ['ModelAgnosticMetaLearning', 'MAML', 'FOMAML']
 
@@ -91,7 +90,7 @@ class ModelAgnosticMetaLearning(object):
                 self.scheduler.base_lrs([group['initial_lr']
                     for group in self.optimizer.param_groups])
 
-    def get_outer_loss(self, batch, eval_mode=False):
+    def get_outer_loss(self, batch, eval_mode=False, repeats=4):
         if 'test' not in batch:
             raise RuntimeError('The batch does not contain any test dataset.')
 
@@ -119,10 +118,13 @@ class ModelAgnosticMetaLearning(object):
         test_targets = batch["test"][1]
 
         if eval_mode:
-            for i in range(train_inputs.size(0)):
-                train_input_exp = train_inputs[i].unsqueeze(0).expand(train_inputs.size(0), *list(train_inputs.size())[1:]).contiguous()
-                train_target_exp = train_targets[i].unsqueeze(0).expand(train_targets.size(0), *list(train_targets.size())[1:]).contiguous()
-                test_input_exp = test_inputs[i].unsqueeze(0).expand(test_inputs.size(0), *list(test_inputs.size())[1:]).contiguous()
+            train_input_exp_total = train_inputs.repeat_interleave(repeats, dim=0)
+            train_target_exp_total = train_targets.repeat_interleave(repeats, dim=0)
+            test_input_exp_total = test_inputs.repeat_interleave(repeats, dim=0)
+            for i in range(repeats):
+                train_input_exp =  train_input_exp_total[i * (train_input_exp_total.size(0) // repeats) : (i+1) * (train_input_exp_total.size(0) // repeats)]
+                train_target_exp =  train_target_exp_total[i * (train_input_exp_total.size(0) // repeats) : (i+1) * (train_input_exp_total.size(0) // repeats)]
+                test_input_exp =  test_input_exp_total[i * (train_input_exp_total.size(0) // repeats) : (i+1) * (train_input_exp_total.size(0) // repeats)]
 
                 params, adaptation_results = self.adapt(train_input_exp, train_target_exp,
                     is_classification_task=is_classification_task,
@@ -131,19 +133,18 @@ class ModelAgnosticMetaLearning(object):
 
                 with torch.set_grad_enabled(False):
                     test_logits = self.model(test_input_exp, params=params)
-                    softmax = torch.nn.functional.softmax(test_logits, dim=-1)
-                    softmax = softmax.mean(dim=0)
-                    test_logits = torch.log(softmax)
-                    outer_loss = self.loss_function(test_logits, test_targets[i])
+                    test_logits = test_logits.view(-1, repeats, *test_logits.size()[1:])
+                    test_logits = test_logits.sum(dim=1)
+                    outer_loss = self.loss_function(test_logits, test_targets[i * (train_inputs.size(0) // repeats) : (i+1) * (train_inputs.size(0) // repeats)])
                     mean_outer_loss += outer_loss
 
                 if is_classification_task:
-                    results['accuracies_after'][i] = compute_accuracy(
-                        test_logits, test_targets[i])
+                    results['accuracies_after'][i * (train_inputs.size(0) // repeats) : (i+1) * (train_inputs.size(0) // repeats)] = compute_accuracy(
+                        test_logits, test_targets[i * (train_inputs.size(0) // repeats) : (i+1) * (train_inputs.size(0) // repeats)])
 
                 torch.cuda.empty_cache()
 
-            mean_outer_loss.div_(num_tasks)
+            mean_outer_loss.div_(repeats)
             results['mean_outer_loss'] = mean_outer_loss.item()
         else:
             params, adaptation_results = self.adapt(train_inputs, train_targets,
@@ -164,7 +165,6 @@ class ModelAgnosticMetaLearning(object):
                 results['accuracies_after'] = compute_accuracy(
                     test_logits, test_targets)
 
-            mean_outer_loss.div_(num_tasks)
             results['mean_outer_loss'] = mean_outer_loss.item()
 
         return mean_outer_loss, results
@@ -177,7 +177,7 @@ class ModelAgnosticMetaLearning(object):
         params = OrderedDict(self.model.meta_named_parameters())
 
         for key in params.keys():
-            if isinstance(params[key], ExpandingParameter):
+            if isinstance(params[key], BatchParameter) and params[key].expanding:
                 params[key] = params[key].expanded(inputs.size(0))
 
         results = {}
@@ -318,7 +318,7 @@ class ModelAgnosticMetaLearning(object):
                     break
 
                 batch = tensors_to_device(batch, device=self.device)
-                _, results = self.get_outer_loss(batch, eval_mode=True)
+                _, results = self.get_outer_loss(batch, eval_mode=False)
                 yield results
 
                 num_batches += 1

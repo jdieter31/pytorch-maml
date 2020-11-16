@@ -14,7 +14,7 @@ from maml.utils import make_warp_model
 import wandb
 from torch.optim.lr_scheduler import LambdaLR
 
-def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
+def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1, phase_shift=0, wavelength=100):
     """
     Create a schedule with a learning rate that decreases linearly from the initial lr set in the optimizer to 0,
     after a warmup period during which it increases linearly from 0 to the initial lr set in the optimizer.
@@ -35,9 +35,10 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 
     def lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
+            return (float(current_step) / float(max(1, num_warmup_steps))) #* (0.5 + 0.5 * math.cos(phase_shift + 2 * math.pi * current_step / wavelength))
+
         return max(
-            0.0, (float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))) # * (0.5 + 0.5 * math.cos(- math.pi + 2 * math.pi * current_step / wavelength))
+            0.0, (float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))) #* (0.5 + 0.5 * math.cos(phase_shift + 2 * math.pi * current_step / wavelength))
         )
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
@@ -157,8 +158,8 @@ def main(args):
         meta_optimizer = torch.optim.Adam(benchmark.model.parameters(), lr=args.meta_lr)
         warp_meta_optimizer = None
 
-    warp_scheduler = get_linear_schedule_with_warmup(warp_meta_optimizer, 500, 100000, last_epoch=-1)
-    scheduler = get_linear_schedule_with_warmup(meta_optimizer, 500, 100000, last_epoch=-1)
+    warp_scheduler = None #get_linear_schedule_with_warmup(warp_meta_optimizer, 200, 100000, last_epoch=-1, phase_shift=-math.pi)
+    scheduler = None #get_linear_schedule_with_warmup(meta_optimizer, 200, 100000, last_epoch=-1)
 
     metalearner = ModelAgnosticMetaLearning(benchmark.model,
                                             meta_optimizer,
@@ -242,7 +243,7 @@ if __name__ == '__main__':
         'updates (default: 1).')
     parser.add_argument('--num-epochs', type=int, default=200,
         help='Number of epochs of meta-training (default: 50).')
-    parser.add_argument('--num-batches', type=int, default=500,
+    parser.add_argument('--num-batches', type=int, default=100,
         help='Number of batch of tasks per epoch (default: 100).')
     parser.add_argument('--num-eval-batches', type=int, default=100)
     parser.add_argument('--step-size', type=float, default=0.1,
@@ -251,15 +252,14 @@ if __name__ == '__main__':
     parser.add_argument('--first-order', action='store_true',
         help='Use the first order approximation, do not use higher-order '
         'derivatives during meta-optimization.')
-    parser.add_argument('--meta-lr', type=float, default=0.0001,
+    parser.add_argument('--meta-lr', type=float, default=0.0005,
         help='Learning rate for the meta-optimizer (optimization of the outer '
         'loss). The default optimizer is Adam (default: 1e-4).')
-    parser.add_argument('--warp-lr', type=float, default=0.00001,
+    parser.add_argument('--warp-lr', type=float, default=0.00003,
         help='Learning rate for the meta-optimizer (optimization of the outer '
         'loss). The default optimizer is Adam (default: 1e-5).')
     parser.add_argument('--num-maml-steps', type=int, default=0,
         help='Number of steps to update initialization for before freezing it')
-    parser.add_argument
 
     # Misc
     parser.add_argument('--num-workers', type=int, default=1,
