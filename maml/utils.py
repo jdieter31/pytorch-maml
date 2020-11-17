@@ -2,7 +2,7 @@ import torch
 
 from collections import OrderedDict
 from torchmeta.modules import MetaModule
-from .model import BatchLinear
+from .model import BatchParameter
 from .transformer_metric import TransformerMetric
 
 from .expm import torch_expm as expm
@@ -45,9 +45,14 @@ class ToTensor1D(object):
 
 def make_warp_model(model):
     metric_params = []
+    for parameter in model.parameters():
+        if isinstance(parameter, BatchParameter):
+            metric_params.append(parameter)
+    """
     for layer in model.modules():
         if isinstance(layer, BatchLinear):
             metric_params.append(layer.weight)
+    """
 
     return TransformerMetric(metric_params)
 
@@ -64,33 +69,32 @@ def kronecker_warp(grad, kronecker_matrices) -> torch.Tensor:
             [meta_batch_size, batch_size, m, m]
     """
 
-    matrix_a = kronecker_matrices[0]
-    matrix_a = matrix_a.view(-1, matrix_a.size(-2), matrix_a.size(-1))
-    matrix_b = kronecker_matrices[1]
-    matrix_b = matrix_b.view(-1, matrix_b.size(-2), matrix_b.size(-1))
-    if len(kronecker_matrices) > 2:
-        matrix_c = kronecker_matrices[2]
-        matrix_c = matrix_c.view(-1, matrix_c.size(-2), matrix_c.size(-1))
+    input_matrices = kronecker_matrices[0]
+    output_matrices = kronecker_matrices[1]
+    all_matrices = input_matrices + output_matrices
+    grad_size = grad.size()
 
-        grad_size = grad.size()
-        grad = grad.view(-1, matrix_a.size(-1), matrix_c.size(-1))
+    first_matrix = all_matrices[0]
+    first_matrix = first_matrix.view(-1, first_matrix.size(-2), first_matrix.size(-1))
+    temp = grad.view(-1, all_matrices[1].size(-1), first_matrix.size(-1))
+    first_matrix = first_matrix.unsqueeze(1).expand(
+            first_matrix.size(0), temp.size(0) // first_matrix.size(0), *first_matrix.size()[1:]
+            ).reshape(-1, first_matrix.size(-2), first_matrix.size(-1))
+    temp = torch.bmm(temp, first_matrix)
+    right_size = first_matrix.size(-1)
 
-        matrix_a = matrix_a.unsqueeze(1).expand(matrix_a.size(0), grad_size[-2], *matrix_a.size()[1:]).reshape(-1, matrix_a.size(-2), matrix_a.size(-1))
-        matrix_c = matrix_c.unsqueeze(1).expand(matrix_c.size(0), grad_size[-2], *matrix_c.size()[1:]).reshape(-1, matrix_c.size(-2), matrix_c.size(-1))
-        prod1 = torch.bmm(matrix_a.transpose(1, 2), grad)
-        prod2 = torch.bmm(prod1, matrix_c)
+    for i, matrix in enumerate(all_matrices[1:]):
+        matrix = matrix.view(-1, matrix.size(-2), matrix.size(-1))
+        matrix = matrix.unsqueeze(1).expand(
+                matrix.size(0), temp.size(0) // matrix.size(0), *matrix.size()[1:]
+                ).reshape(-1, matrix.size(-2), matrix.size(-1))
+        temp = torch.bmm(matrix, temp)
 
-        temp = prod2.view(-1, matrix_b.size(-1), grad_size[-1])
-        prod3 = torch.bmm(matrix_b, temp)
-        return prod3.view(grad_size)
-    else:
-        grad_shape = grad.size()
-        grad = grad.view(-1, grad.size(-2), grad.size(-1))
+        if i < len(all_matrices) - 2:
+            right_size *= matrix.size(-1)
+            temp = temp.view(-1, all_matrices[i + 2].size(-1), right_size)
 
-        prod1 = torch.bmm(matrix_b, grad)
-        prod2 = torch.bmm(prod1, torch.transpose(matrix_a, 1, 2))
-
-        return prod2.view(grad_shape)
+    return temp.view(grad_size)
 
 def gradient_update_parameters_warp(model,
                                loss,
@@ -141,36 +145,29 @@ def gradient_update_parameters_warp(model,
     if warp_model is not None:
         warp_model_input = []
         for param in warp_model.warp_parameters:
-            warp_model_input.append([param.input_data, param.grad_data])
+            if param.collect_input:
+                warp_model_input.append([param.input_data, param.grad_data])
 
-        kronecker_matrix_logs, state = warp_model(warp_model_input, state=state)
+        kronecker_matrix_logs = warp_model(warp_model_input)
         kronecker_matrices = []
 
-        #for matrix_a, matrix_b in kronecker_matrix_logs:
         for kronecker_matrix_list in kronecker_matrix_logs:
-            matrix_a = kronecker_matrix_list[0]
-            matrix_b = kronecker_matrix_list[1]
-            if len(kronecker_matrix_list) > 2:
-                matrix_c = kronecker_matrix_list[2]
+            input_matrices = kronecker_matrix_list[0]
+            output_matrices = kronecker_matrix_list[1]
 
-            # Negative because we want metric inverse
-            exp_matrix_a = torch.matrix_exp(-matrix_a.reshape((-1, matrix_a.size(-2),
-                                                   matrix_a.size(-1))))
-            exp_matrix_a = exp_matrix_a.reshape(matrix_a.size())
+            exp_input_matrices = []
+            for matrix in input_matrices:
+                exp_matrix = torch.matrix_exp(-matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
+                exp_matrix = exp_matrix.reshape(matrix.size())
+                exp_input_matrices.append(exp_matrix)
 
-            exp_matrix_b = torch.matrix_exp(-matrix_b.reshape((-1, matrix_b.size(-2),
-                                                   matrix_b.size(-1))))
-            exp_matrix_b = exp_matrix_b.reshape(matrix_b.size())
+            exp_output_matrices = []
+            for matrix in output_matrices:
+                exp_matrix = torch.matrix_exp(-matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
+                exp_matrix = exp_matrix.reshape(matrix.size())
+                exp_output_matrices.append(exp_matrix)
 
-            if len(kronecker_matrix_list) > 2:
-                exp_matrix_c = torch.matrix_exp(-matrix_c.reshape((-1, matrix_c.size(-2),
-                                                    matrix_c.size(-1))))
-                exp_matrix_c = exp_matrix_c.reshape(matrix_c.size())
-
-                kronecker_matrices.append([exp_matrix_a, exp_matrix_b, exp_matrix_c])
-            else:
-                kronecker_matrices.append([exp_matrix_a, exp_matrix_b])
-
+            kronecker_matrices.append([exp_input_matrices, exp_output_matrices])
 
     updated_params = OrderedDict()
 

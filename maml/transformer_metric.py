@@ -1,20 +1,35 @@
 import torch
 from torch import nn
 from typing import List
-from math import sqrt, ceil
+from math import sqrt, floor, ceil
 from torch.nn.init import orthogonal_
 from torch.nn.modules.normalization import LayerNorm
+import numpy as np
+
+def primes(n):
+    primfac = []
+    d = 2
+    while d*d <= n:
+        while (n % d) == 0:
+            primfac.append(d)  # supposing you want multiple factors repeated
+            n //= d
+        d += 1
+    if n > 1:
+       primfac.append(n)
+    return primfac
 
 class MiniConvBlock(nn.Module):
 
-    def __init__(self, in_size, in_channels, out_channels, out_flat, **kwargs):
+    def __init__(self, in_size, in_channels, out_channels, pool=True, pool_size=2, **kwargs):
         super(MiniConvBlock, self).__init__()
 
         self.conv = nn.Conv2d(in_channels, out_channels, **kwargs)
         self.norm = nn.BatchNorm2d(out_channels, momentum=1,
                 track_running_stats=False)
         self.relu = nn.ReLU()
-        self.linear = nn.Linear(in_size * out_channels, out_flat, bias=True)
+        self.pool = None
+        if pool:
+            self.pool = nn.MaxPool2d(pool_size)
 
     def forward(self, input_data):
         batch_sizes = input_data.size()[:2]
@@ -22,15 +37,15 @@ class MiniConvBlock(nn.Module):
         out = self.conv(out)
         out = self.norm(out)
         out = self.relu(out)
+        if self.pool is not None:
+            out = self.pool(out)
         out = out.reshape(*batch_sizes, -1)
-        out = self.linear(out)
-        out = self.relu(out)
         return out
 
 
 class TransformerMetric(nn.Module):
 
-    def __init__(self, warp_parameters, hidden_size: int = 256, transformer_layers: int = 3, transformer_heads: int = 8, transformer_feedforward_dim: int = 1024, transformer_d_model: int = 256, transformer_cascade_direction: str = "bidirectional", num_outer_products = 16, conv_hidden_dim: int = 2048):
+    def __init__(self, warp_parameters, hidden_size: int = 64, transformer_layers: int = 3, transformer_heads: int = 8, transformer_feedforward_dim: int = 512, transformer_d_model: int = 64, conv_hidden_dim: int = 2, reduction_factor=4):
 
         super(TransformerMetric, self).__init__()
 
@@ -42,325 +57,152 @@ class TransformerMetric(nn.Module):
         self.transformer_heads = transformer_heads
         self.transformer_feedforward_dim = transformer_feedforward_dim
         self.transformer_d_model = transformer_d_model
-        self.transformer_cascade_direction = transformer_cascade_direction
-        self.num_outer_products = num_outer_products
         self.conv_hidden_dim = conv_hidden_dim
+        total_input_dim = 0
 
         for param in warp_parameters:
+            if not param.collect_input:
+                continue
             if param.convolutional:
-                hidden_dim = ceil(conv_hidden_dim / param.in_size)
+                dim = sqrt(param.in_size)
+                if dim >= 32:
+                    pool = True
+                    pool_size = int(dim // 16)
+                elif dim >= 16:
+                    pool = True
+                    pool_size = int(dim // 4)
+                else:
+                    pool = False
+                    pool_size = 0
 
-                mini_conv_block_1 = MiniConvBlock(param.in_size, param.in_channels, hidden_dim, self.transformer_d_model // 2, kernel_size=3, stride=1, padding=1, bias=True)
-                mini_conv_block_2 = MiniConvBlock(param.in_size, param.size(-2), hidden_dim, self.transformer_d_model // 2, kernel_size=3, stride=1, padding=1, bias=True)
-                self.input_modules.append(nn.ModuleList([mini_conv_block_1, mini_conv_block_2]))
+                output_size = param.in_size
+                if pool:
+                    output_size  = floor(dim / pool_size) ** 2
+                output_size *= conv_hidden_dim
+                total_input_dim += 2 * ceil(output_size / reduction_factor)
+
+                mini_conv_block_1 = MiniConvBlock(param.in_size, param.in_channels, conv_hidden_dim, kernel_size=3, stride=1, padding=1, bias=True, pool=pool, pool_size=pool_size)
+                mini_conv_block_2 = MiniConvBlock(param.in_size, param.size(-2), conv_hidden_dim, kernel_size=3, stride=1, padding=1, bias=True, pool=pool, pool_size=pool_size)
+                linear_1 = nn.Linear(output_size, ceil(output_size / reduction_factor), bias = True)
+                linear_2 = nn.Linear(output_size, ceil(output_size / reduction_factor), bias = True)
+                in_module_1 = nn.Sequential(mini_conv_block_1, linear_1, nn.ReLU())
+                in_module_2 = nn.Sequential(mini_conv_block_2, linear_2, nn.ReLU())
+                self.input_modules.append(nn.ModuleList([in_module_1, in_module_2]))
             else:
-                input_dim = param.size(2) + param.size(1)
-                self.input_modules.append(nn.Linear(input_dim,
-                                                self.transformer_d_model))
+                total_input_dim += ceil(param.size(2) / reduction_factor) + ceil(param.size(1) / reduction_factor)
+                linear_1 = nn.Linear(param.size(2), ceil(param.size(2) / reduction_factor), bias = True)
+                linear_2 = nn.Linear(param.size(1), ceil(param.size(1) / reduction_factor), bias = True)
+                self.input_modules.append(nn.ModuleList([linear_1, linear_2]))
+
         self.input_modules = nn.ModuleList(self.input_modules)
-        direction = self.transformer_cascade_direction
+        self.input_linear = nn.Linear(total_input_dim, self.transformer_d_model, bias=True)
+        self.relu = nn.ReLU()
+        self.layer_norms = nn.ModuleList([LayerNorm(self.transformer_d_model) for _ in range(self.transformer_layers)])
 
+        self.transformer_encoder_layers = []
+        for _ in range(self.transformer_layers):
+            self.transformer_encoder_layers.append(
+                nn.TransformerEncoderLayer(self.transformer_d_model,
+                                            self.transformer_heads,
+                                            self.transformer_feedforward_dim,
+                                            dropout=0)
+            )
 
-        self.layer_norms = []
-        for i in range(self.transformer_layers):
-            self.layer_norms.append([])
-            for j in range(len(warp_parameters)):
-                self.layer_norms[-1].append(LayerNorm(self.transformer_d_model))
+        self.transformer_encoder_layers = nn.ModuleList(self.transformer_encoder_layers)
 
-        self.layer_norms = nn.ModuleList([nn.ModuleList(self.layer_norms[i]) for i in range(self.transformer_layers)])
+        self.output_shapes = []
+        self.input_shapes = []
 
-
-        if direction == "forward" or direction == "bidirectional":
-            self.forward_transformers = [[] for _ in range(self.transformer_layers)]
-            for i in range(self.transformer_layers):
-                for j in range(len(warp_parameters)):
-                    """
-                    if j == 0:
-                        self.forward_transformers[i].append(
-                            nn.TransformerEncoderLayer(self.transformer_d_model,
-                                                      self.transformer_heads,
-                                                      self.transformer_feedforward_dim,
-                                                      dropout=0)
-                        )
-                    else:
-                    """
-                    self.forward_transformers[i].append(
-                        nn.TransformerDecoderLayer(self.transformer_d_model,
-                                                    self.transformer_heads,
-                                                    self.transformer_feedforward_dim,
-                                                    dropout=0)
-                    )
-
-            self.forward_transformers = nn.ModuleList([nn.ModuleList(transformers) for transformers in self.forward_transformers])
-
-        if direction == "backward" or direction =="bidirectional":
-            self.backward_transformers = [[] for _ in
-                                         range(self.transformer_layers)]
-            for i in range(self.transformer_layers):
-                for j in range(len(warp_parameters)):
-                    """
-                    if j == len(warp_parameters) - 1:
-                        self.backward_transformers[i].append(
-                            nn.TransformerEncoderLayer(self.transformer_d_model,
-                                                      self.transformer_heads,
-                                                      self.transformer_feedforward_dim,
-                                                      dropout=0)
-                        )
-                    else:
-                    """
-                    self.backward_transformers[i].append(
-                        nn.TransformerDecoderLayer(self.transformer_d_model,
-                                                    self.transformer_heads,
-                                                    self.transformer_feedforward_dim,
-                                                    dropout=0)
-                    )
-            self.backward_transformers = nn.ModuleList([nn.ModuleList(transformers) for transformers in self.backward_transformers])
-
-        if direction == "bidirectional":
-            # If we have a bidirectional flow we need a layer to take in the
-            # two d_model tensors from the outputs of the forward and backward
-            # transformers and half their dimension to be able to be fed into
-            # the next layer
-            self.dimension_halfs = nn.ModuleList([
-                nn.Linear(self.transformer_d_model * 2,
-                       self.transformer_d_model) \
-                for _ in range(self.transformer_layers)])
-
-        self.output_heads = []
+        output_head_dim = 0
         for param in warp_parameters:
-            if param.convolutional:
-                self.output_heads.append(
-                    [
-                        nn.Linear(self.transformer_d_model,
-                                self.num_outer_products *
-                                param.size(1)),
-                        #nn.Linear(self.transformer_d_model,
-                        #          self.num_outer_products),
-                        nn.Linear(self.transformer_d_model,
-                                self.num_outer_products *
-                                param.size(2) // param.kernel_size),
-
-                        nn.Linear(self.transformer_d_model,
-                                self.num_outer_products *
-                                  param.kernel_size),
-                        #nn.Linear(self.transformer_d_model,
-                        #          self.num_outer_products),
-                        nn.Linear(self.transformer_d_model,
-                                  1),
-                        nn.Linear(self.transformer_d_model,
-                                  1),
-                        nn.Linear(self.transformer_d_model,
-                                  1)
-                    ]
-                )
-
-                # Initialize to be sufficiently small to be suitable for matrix
-                # exponential
-                with torch.no_grad():
-                    self.output_heads[-1][0].weight /= param.size(1) * param.size(2)
-                    self.output_heads[-1][1].weight /= param.size(1) * param.size(2)
-                    self.output_heads[-1][2].weight /= param.size(1) * param.size(2)
-                    orthogonal_(self.output_heads[-1][0].bias.view(
-                        self.num_outer_products, param.size(1)))
-                    orthogonal_(self.output_heads[-1][1].bias.view(
-                        self.num_outer_products, param.size(2) // param.kernel_size))
-                    orthogonal_(self.output_heads[-1][2].bias.view(
-                        self.num_outer_products, param.kernel_size))
+            total_input_shape = []
+            if param.in_division is not None:
+                for dimension in param.in_division:
+                    total_input_shape.append(dimension)
             else:
-                self.output_heads.append(
-                    [
-                        nn.Linear(self.transformer_d_model,
-                                self.num_outer_products *
-                                param.size(1)),
-                        #nn.Linear(self.transformer_d_model,
-                        #          self.num_outer_products),
-                        nn.Linear(self.transformer_d_model,
-                                self.num_outer_products *
-                                param.size(2)),
-                        #nn.Linear(self.transformer_d_model,
-                        #          self.num_outer_products),
-                        nn.Linear(self.transformer_d_model,
-                                  1),
-                        nn.Linear(self.transformer_d_model,
-                                  1)
-                    ]
-                )
+                total_input_shape.append(param.size(2))
+            self.input_shapes.append(total_input_shape)
 
-                # Initialize to be sufficiently small to be suitable for matrix
-                # exponential
-                with torch.no_grad():
-                    self.output_heads[-1][0].weight /= param.size(1) * param.size(2)
-                    self.output_heads[-1][1].weight /= param.size(1) * param.size(2)
-                    orthogonal_(self.output_heads[-1][0].bias.view(
-                        self.num_outer_products, param.size(1)))
-                    orthogonal_(self.output_heads[-1][1].bias.view(
-                        self.num_outer_products, param.size(2)))
+            total_output_shape = []
+            if param.out_division is not None:
+                for dimension in param.out_division:
+                    total_output_shape.append(dimension)
+            else:
+                total_output_shape.append(param.size(1))
+            self.output_shapes.append(total_output_shape)
 
-                # Don't make scalars too big
-                # self.output_heads[-1][1].weight /= self.num_outer_products
-                # self.output_heads[-1][1].bias /= self.num_outer_products
-                # self.output_heads[-1][3].weight /= self.num_outer_products
-                # self.output_heads[-1][3].bias /= self.num_outer_products
-        self.output_heads = nn.ModuleList([nn.ModuleList(output_head) for output_head in self.output_heads])
+            for dim in total_input_shape:
+                output_head_dim += (dim * (dim + 1)) // 2
+
+            for dim in total_output_shape:
+                output_head_dim += (dim * (dim + 1)) // 2
+
+        self.output_head = nn.Linear(self.transformer_d_model, output_head_dim, bias=True)
+        with torch.no_grad():
+            self.output_head.weight /= 10000
+            self.output_head.bias /= 10000
+
+        import ipdb; ipdb.set_trace()
 
     def forward(self, warp_inputs: List[List[torch.Tensor]], state: List[List[torch.Tensor]] = None):
         embeddings = []
-        direction = self.transformer_cascade_direction
 
         # Get all inputs to be same dimension so we can pass through the
         # transformer cascade
         for i, warp_input in enumerate(warp_inputs):
-            if self.warp_parameters[i].convolutional:
-                embeddings_1 = self.input_modules[i][0](warp_input[0])
-                embeddings_2 = self.input_modules[i][1](warp_input[1])
-                embeddings.append(torch.cat([embeddings_1, embeddings_2], dim=-1))
-            else:
-                embeddings.append(self.input_modules[i](torch.cat(warp_input, dim=-1)))
+            embeddings_1 = self.input_modules[i][0](warp_input[0])
+            embeddings_2 = self.input_modules[i][1](warp_input[1])
+            embeddings += [embeddings_1, embeddings_2]
 
-        if state is None:
-            state = [None, None]
-            if direction == "forward" or direction == "bidirectional":
-                state[0] = []
-                for i in range(self.transformer_layers):
-                    state_tensor = torch.zeros_like(embeddings[0].transpose(0,1))
-                    state[0].append(state_tensor)
-
-            if direction == "backward" or direction == "bidirectional":
-                state[1] = []
-                for i in range(self.transformer_layers):
-                    state_tensor = torch.zeros_like(embeddings[0].transpose(0,1))
-                    state[1].append(state_tensor)
+        embeddings = torch.cat(embeddings, dim=-1)
+        embeddings = self.input_linear(embeddings)
+        embeddings = self.relu(embeddings)
+        embeddings = embeddings.transpose(0,1)
 
         for i in range(self.transformer_layers):
-            if direction == "forward" or direction == "bidirectional":
-                forward_transformer_out = []
-                memory = None
-                for j, embedding in enumerate(embeddings):
-                    if j == 0:
-                        memory = self.forward_transformers[i][j](
-                            embedding.transpose(0,1), state[0][i])
-                    else:
-                        memory = self.forward_transformers[i][j](
-                            embedding.transpose(0,1), memory)
+            embeddings = self.transformer_encoder_layers[i](embeddings)
+            embeddings = self.layer_norms[i](embeddings)
 
-                    if j == len(embeddings) - 1:
-                        state[0][i] = memory
+        embeddings = embeddings.transpose(0,1)
 
-                    forward_transformer_out.append(memory)
-                forward_transformer_out = torch.stack(forward_transformer_out)
+        output_raw = self.output_head(embeddings)
+        output_raw_size = output_raw.size()
+        output_raw = output_raw.reshape([-1, output_raw.size(-1)])
+        range_start = 0
+        kronecker_matrices = []
+        for i, param in enumerate(self.warp_parameters):
+            output_matrices = []
+            for dim in self.output_shapes[i]:
+                length = (dim * (dim + 1)) // 2
+                matrix_gen = output_raw[:, range_start : range_start + length]
+                range_start += length
+                matrix = torch.zeros(matrix_gen.size(0), dim, dim, device=matrix_gen.device)
+                triu_indices = torch.triu_indices(dim, dim, 1, device=matrix.device)
+                if triu_indices.size(-1) > 0:
+                    matrix[:, triu_indices[0], triu_indices[1]] = matrix_gen[:,:-dim]
+                    matrix[:, triu_indices[1], triu_indices[0]] = matrix_gen[:,:-dim]
+                eye_indices = torch.arange(0, dim, device=matrix.device, dtype=torch.long)
+                matrix[:, eye_indices, eye_indices] = matrix_gen[:,-dim:]
+                matrix = matrix.reshape(list(output_raw_size)[:-1] + 2 * [dim])
+                output_matrices.append(matrix)
 
-            if direction == "backward" or direction == "bidirectional":
-                backward_transformer_out = []
-                memory = None
-                for j, embedding in reversed(list(enumerate(embeddings))):
-                    if j == len(embeddings) - 1:
-                        memory = self.backward_transformers[i][j](
-                            embedding.transpose(0,1), state[1][i])
-                    else:
-                        memory = self.backward_transformers[i][j](
-                            embedding.transpose(0,1), memory)
+            input_matrices = []
+            for dim in self.input_shapes[i]:
+                length = (dim * (dim + 1)) // 2
+                matrix_gen = output_raw[:, range_start : range_start + length]
+                range_start += length
+                matrix = torch.zeros(matrix_gen.size(0), dim, dim, device=matrix_gen.device)
+                triu_indices = torch.triu_indices(dim, dim, 1, device=matrix.device)
+                if triu_indices.size(-1) > 0:
+                    matrix[:, triu_indices[0], triu_indices[1]] = matrix_gen[:,:-dim]
+                    matrix[:, triu_indices[1], triu_indices[0]] = matrix_gen[:,:-dim]
+                eye_indices = torch.arange(0, dim, device=matrix.device, dtype=torch.long)
+                matrix[:, eye_indices, eye_indices] = matrix_gen[:,-dim:]
+                matrix = matrix.reshape(list(output_raw_size)[:-1] + 2 * [dim])
+                input_matrices.append(matrix)
 
-                    if j == 0:
-                        state[1][i] = memory
-
-                    backward_transformer_out.insert(0, memory)
-                backward_transformer_out = torch.stack(backward_transformer_out)
-
-            if direction == "bidirectional":
-                embeddings = torch.cat((forward_transformer_out,
-                                        backward_transformer_out), dim=-1)
-                embeddings = self.dimension_halfs[i](embeddings)
-                embeddings = embeddings.transpose(1,2)
-
-            if direction == "forward":
-                embeddings = forward_transformer_out.transpose(1,2)
-
-            if direction == "backward":
-                embeddings = backward_transformer_out.transpose(1,2)
-
-            for j in range(len(embeddings)):
-                embeddings[j][i] = self.layer_norms[i][j](embeddings[j][i])
-
-        output_matrices = []
-        for i, (embedding, param) in enumerate(zip(embeddings,
-                                                   self.warp_parameters)):
-            matrix_b_gen = self.output_heads[i][0](embedding)
-            #matrix_b_scalar = self.output_heads[i][1](embedding)
-            matrix_a_gen = self.output_heads[i][1](embedding)
-
-            if len(self.output_heads[i]) > 4:
-                matrix_c_gen = self.output_heads[i][2](embedding)
-
-                matrix_b_eye = self.output_heads[i][3](embedding)
-                matrix_a_eye = self.output_heads[i][4](embedding)
-            else:
-                matrix_b_eye = self.output_heads[i][2](embedding)
-                matrix_a_eye = self.output_heads[i][3](embedding)
-
-            original_shape_b = matrix_b_gen.size()
-            new_shape_b = [-1, param.size(1)]
-            matrix_b_gen = matrix_b_gen.reshape(new_shape_b)
-            # matrix_b_scalar = matrix_b_scalar.reshape([-1,1])
-
-            # Get scalars times outer products
-            matrix_b = torch.bmm(# matrix_b_scalar.unsqueeze(-1) * \
-                                 matrix_b_gen.unsqueeze(-1),
-                                 matrix_b_gen.unsqueeze(-2))
-            matrix_b = matrix_b.reshape(list(original_shape_b)[:-1] +
-                             [self.num_outer_products] + 2 * [param.size(1)])
-            matrix_b = matrix_b.sum(dim=-3)
-
-            matrix_b += matrix_b_eye.unsqueeze(-1) * \
-                    torch.eye(matrix_b.size(-1), device=matrix_b.device
-                            ).unsqueeze(0).unsqueeze(0).expand_as(matrix_b)
-
-            original_shape_a = matrix_a_gen.size()
-            if len(self.output_heads[i]) > 4:
-                new_shape_a = [-1, param.size(2) // param.kernel_size]
-            else:
-                new_shape_a = [-1, param.size(2)]
-            matrix_a_gen = matrix_a_gen.reshape(new_shape_a)
-            # matrix_a_scalar = matrix_a_scalar.reshape([-1,1])
-            matrix_a = torch.bmm(# matrix_a_scalar.unsqueeze(-1) * \
-                                 matrix_a_gen.unsqueeze(-1),
-                                 matrix_a_gen.unsqueeze(-2))
-            if len(self.output_heads[i]) > 4:
-                matrix_a = matrix_a.reshape(list(original_shape_a)[:-1] +
-                                [self.num_outer_products] + 2 * [param.size(2) // param.kernel_size])
-            else:
-                matrix_a = matrix_a.reshape(list(original_shape_a)[:-1] +
-                                [self.num_outer_products] + 2 * [param.size(2)])
-            matrix_a = matrix_a.sum(dim=-3)
-
-            matrix_a += matrix_a_eye.unsqueeze(-1) * \
-                    torch.eye(matrix_a.size(-1), device=matrix_a.device
-                            ).unsqueeze(0).unsqueeze(0).expand_as(matrix_a)
-            if len(self.output_heads[i]) > 4:
-                original_shape_c = matrix_c_gen.size()
-                new_shape_c = [-1, param.kernel_size]
-                matrix_c_gen = matrix_c_gen.reshape(new_shape_c)
-
-                matrix_c_eye = self.output_heads[i][5](embedding)
-                # matrix_c_scalar = matrix_c_scalar.reshape([-1,1])
-
-                # Get scalars times outer products
-                matrix_c = torch.bmm(# matrix_c_scalar.unsqueeze(-1) * \
-                                    matrix_c_gen.unsqueeze(-1),
-                                    matrix_c_gen.unsqueeze(-2))
-                matrix_c = matrix_c.reshape(list(original_shape_c)[:-1] +
-                                [self.num_outer_products] + 2 * [param.kernel_size])
-                matrix_c = matrix_c.sum(dim=-3)
-
-                matrix_c += matrix_c_eye.unsqueeze(-1) * \
-                        torch.eye(matrix_c.size(-1), device=matrix_c.device
-                                ).unsqueeze(0).unsqueeze(0).expand_as(matrix_c)
-
-                output_matrices.append([matrix_a, matrix_b, matrix_c])
-
-            else:
-                output_matrices.append([matrix_a, matrix_b])
-
-        return output_matrices, state
+            kronecker_matrices.append([input_matrices, output_matrices])
+        return kronecker_matrices
 
     def set_listening(self, listening: bool):
         for param in self.warp_parameters:

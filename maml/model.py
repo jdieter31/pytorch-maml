@@ -11,7 +11,7 @@ from torchmeta.modules import (MetaModule, MetaConv2d, MetaBatchNorm2d,
 __mode__ = "Expanding"
 
 class BatchParameter(nn.Parameter):
-    def __new__(cls, data=None, convolutional=False, in_size=0, in_channels=0, requires_grad=True, expanding=False, expanding_factor=32, kernel_size=9):
+    def __new__(cls, data=None, convolutional=False, in_size=0, in_channels=0, requires_grad=True, expanding=False, expanding_factor=32, in_division=None, out_division=None, collect_input=True):
         if data is None:
             data = torch.Tensor()
 
@@ -24,7 +24,9 @@ class BatchParameter(nn.Parameter):
         instance.in_channels = in_channels
         instance.in_size = in_size
         instance.expanding_factor = expanding_factor
-        instance.kernel_size = kernel_size
+        instance.in_division = in_division
+        instance.out_division = out_division
+        instance.collect_input = collect_input
         return instance
 
     def expanded(self, meta_batch_size):
@@ -38,27 +40,28 @@ class BatchLinear(MetaModule):
         self.input_size = input_size
         self.output_size = output_size
         self.bias = bias
-        if bias:
-            input_size += 1
 
         self.expanding = expanding
         if expanding:
             self.weight = BatchParameter(torch.Tensor(meta_batch_size // expanding_factor, self.output_size,
                                                     input_size), expanding=True, expanding_factor=expanding_factor)
+            if bias:
+                self.bias_value = BatchParameter(torch.Tensor(meta_batch_size // expanding_factor, self.output_size, 1), collect_input=False, expanding=True)
         else:
             self.weight = BatchParameter(torch.Tensor(meta_batch_size, self.output_size,
                                                     input_size))
+            if bias:
+                self.bias_value = BatchParameter(torch.Tensor(meta_batch_size, self.output_size, 1), collect_input=False)
         self.reset_parameters()
 
     def reset_parameters(self):
+
+        init.kaiming_uniform_(self.weight[:, :, :], a=math.sqrt(5))
         if self.bias:
-            init.kaiming_uniform_(self.weight[:, :, :-1], a=math.sqrt(5))
             fan_in, _ = init._calculate_fan_in_and_fan_out(
-                self.weight[:, :, :-1])
+                self.weight[:, :, :])
             bound = 1 / math.sqrt(fan_in)
-            init.uniform_(self.weight[:, :, -1], -bound, bound)
-        else:
-            init.kaiming_uniform_(self.weight[:, :, :], a=math.sqrt(5))
+            init.uniform_(self.bias_value[:, :, 0], -bound, bound)
 
     def forward(self, input_data, params=None, save_warp_data=True):
         if self.expanding:
@@ -67,17 +70,27 @@ class BatchLinear(MetaModule):
             weight = self.weight.expanded(input_data.size(0)) if params is None else params["weight"]
 
         if self.bias:
-            input_data = torch.cat([input_data,
+            if self.expanding:
+                bias_value = self.bias_value if params is None else params["bias_value"]
+            else:
+                bias_value = self.bias_value.expanded(input_data.size(0)) if params is None else params["bias_value"]
+
+            weight = torch.cat([weight, bias_value], dim=-1)
+
+        if self.bias:
+            input_data_exp = torch.cat([input_data,
                 torch.ones(*input_data.size()[:-1], 1, device=input_data.device)], -1)
+        else:
+            input_data_exp = input_data
 
         if input_data.ndim > 3:
-            input_data_resized = input_data.view(input_data.size(0), -1, input_data.size(-1))
+            input_data_resized = input_data_exp.view(input_data_exp.size(0), -1, input_data_exp.size(-1))
             out = torch.transpose(torch.bmm(weight, torch.transpose(input_data_resized, 1,
                                                                         2)), 1, 2)
             out = out.reshape(*(input_data.size()[:-1] + out.size()[-1:]))
 
         else:
-            out = torch.transpose(torch.bmm(weight, torch.transpose(input_data, 1,
+            out = torch.transpose(torch.bmm(weight, torch.transpose(input_data_exp, 1,
                                                                         2)), 1, 2)
         if save_warp_data:
             self.enable_warp_data(input_data, out)
@@ -158,7 +171,7 @@ def unfold(input, kernel_size, dilation=1, padding=0, stride=1):
 
 class BatchConv2d(BatchLinear):
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size, stride = 1, padding = 0, dilation = 1, groups: int = 1, bias: bool = True, padding_mode: str = 'zeros', in_size=28, meta_batch_size=1, expanding=True, expanding_factor=32):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size, stride = 1, padding = 0, dilation = 1, groups: int = 1, bias: bool = True, padding_mode: str = 'zeros', in_size=28, meta_batch_size=1, expanding=True, expanding_factor=32, out_division=None):
         # Call grandparent
         super(BatchLinear, self).__init__()
 
@@ -169,28 +182,30 @@ class BatchConv2d(BatchLinear):
         self.padding = (padding, padding) if isinstance(padding, int) else padding
         self.dilation = (dilation, dilation) if isinstance(dilation, int) else dilation
         self.groups = groups
-        self.bias = False
-        self.conv_bias = bias
+        self.bias = bias
         self.padding_mode = padding_mode
 
         # self.linear = BatchLinear(self.in_channels * self.kernel_size[0] * self.kernel_size[1], out_channels, bias)
 
         # Init BatchLinear
         total_kernel_size = self.kernel_size[0] * self.kernel_size[1]
-        if self.conv_bias:
-            total_kernel_size += 1
 
         self.input_size = self.in_channels * total_kernel_size
         self.output_size = out_channels
         self.expanding = expanding
+        in_division = [self.in_channels, self.kernel_size[0], self.kernel_size[1]]
 
         if expanding:
             self.weight = BatchParameter(torch.Tensor(meta_batch_size // expanding_factor, self.output_size,
                                                     self.input_size), convolutional=True, in_size=in_size,
-                                                    in_channels=self.in_channels, expanding=True, expanding_factor=expanding_factor, kernel_size=total_kernel_size)
+                                                    in_channels=self.in_channels, expanding=True, expanding_factor=expanding_factor, in_division=in_division, out_division=out_division)
+            if bias:
+                self.bias_value = BatchParameter(torch.Tensor(meta_batch_size // expanding_factor, self.output_size, 1), collect_input=False, expanding=True)
         else:
             self.weight = BatchParameter(torch.Tensor(meta_batch_size, self.output_size,
-                                                    self.input_size), convolutional=True, in_size=in_size, in_channels=self.in_channels, kernel_size=total_kernel_size)
+                                                    self.input_size), convolutional=True, in_size=in_size, in_channels=self.in_channels, in_division=in_division, out_division=out_division)
+            if bias:
+                self.bias_value = BatchParameter(torch.Tensor(meta_batch_size, self.output_size, 1), collect_input=False)
         self.reset_parameters()
 
     def forward(self, inputs, params = None):
@@ -204,11 +219,13 @@ class BatchConv2d(BatchLinear):
 
         # out_unf = self.linear(inp_unf, params=self.get_subdict(params, 'linear')).transpose(-1, -2)
 
+        """
         if self.conv_bias:
             inp_unf = inp_unf.view(meta_batch_size, batch_size, -1, in_channels, inp_unf.size(-1) // in_channels)
             inp_unf = torch.cat([inp_unf,
                 torch.ones(*inp_unf.size()[:-1], 1, device=inp_unf.device)], -1)
             inp_unf = inp_unf.view(meta_batch_size, batch_size, -1, in_channels * self.weight.kernel_size)
+        """
 
         out_unf = super().forward(inp_unf, params=params, save_warp_data=False).transpose(-1, -2)
 
@@ -276,7 +293,7 @@ class MetaConvModel(MetaModule):
            for Fast Adaptation of Deep Networks. International Conference on
            Machine Learning (ICML) (https://arxiv.org/abs/1703.03400)
     """
-    def __init__(self, in_channels, out_features, hidden_size=64, feature_size=64, in_size=28, meta_batch_size=1):
+    def __init__(self, in_channels, out_features, hidden_size=64, feature_size=64, in_size=28, meta_batch_size=1, hidden_division=None):
         super(MetaConvModel, self).__init__()
         self.in_channels = in_channels
         self.out_features = out_features
@@ -289,13 +306,13 @@ class MetaConvModel(MetaModule):
 
         self.features = MetaSequential(OrderedDict([
             ('layer1', conv_block(in_channels, hidden_size, kernel_size=3,
-                                  stride=1, padding=1, bias=True, in_size=in_sizes[0]**2, meta_batch_size=meta_batch_size)),
+                                  stride=1, padding=1, bias=True, in_size=in_sizes[0]**2, meta_batch_size=meta_batch_size, out_division=hidden_division)),
             ('layer2', conv_block(hidden_size, hidden_size, kernel_size=3,
-                                  stride=1, padding=1, bias=True, in_size=in_sizes[1]**2, meta_batch_size=meta_batch_size)),
+                                  stride=1, padding=1, bias=True, in_size=in_sizes[1]**2, meta_batch_size=meta_batch_size, out_division=hidden_division)),
             ('layer3', conv_block(hidden_size, hidden_size, kernel_size=3,
-                                  stride=1, padding=1, bias=True, in_size=in_sizes[2]**2, meta_batch_size=meta_batch_size)),
+                                  stride=1, padding=1, bias=True, in_size=in_sizes[2]**2, meta_batch_size=meta_batch_size, out_division=hidden_division)),
             ('layer4', conv_block(hidden_size, hidden_size, kernel_size=3,
-                                  stride=1, padding=1, bias=True, in_size=in_sizes[3]**2, meta_batch_size=meta_batch_size))
+                                  stride=1, padding=1, bias=True, in_size=in_sizes[3]**2, meta_batch_size=meta_batch_size, out_division=hidden_division))
         ]))
         self.classifier = BatchLinear(feature_size, out_features, bias=True, meta_batch_size=meta_batch_size)
 

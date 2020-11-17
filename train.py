@@ -255,7 +255,7 @@ if __name__ == '__main__':
     parser.add_argument('--meta-lr', type=float, default=0.0005,
         help='Learning rate for the meta-optimizer (optimization of the outer '
         'loss). The default optimizer is Adam (default: 1e-4).')
-    parser.add_argument('--warp-lr', type=float, default=0.00003,
+    parser.add_argument('--warp-lr', type=float, default=0.0005,
         help='Learning rate for the meta-optimizer (optimization of the outer '
         'loss). The default optimizer is Adam (default: 1e-5).')
     parser.add_argument('--num-maml-steps', type=int, default=0,
