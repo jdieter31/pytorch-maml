@@ -45,7 +45,7 @@ class MiniConvBlock(nn.Module):
 
 class TransformerMetric(nn.Module):
 
-    def __init__(self, warp_parameters, hidden_size: int = 64, transformer_layers: int = 3, transformer_heads: int = 8, transformer_feedforward_dim: int = 512, transformer_d_model: int = 64, conv_hidden_dim: int = 2, reduction_factor=4):
+    def __init__(self, warp_parameters, hidden_size: int = 64, transformer_layers: int = 1, transformer_heads: int = 8, transformer_feedforward_dim: int = 256, transformer_d_model: int = 64, conv_hidden_dim: int = 16, reduction_factor=4, num_sym_tensor_products = 16, dropout=0):
 
         super(TransformerMetric, self).__init__()
 
@@ -58,6 +58,8 @@ class TransformerMetric(nn.Module):
         self.transformer_feedforward_dim = transformer_feedforward_dim
         self.transformer_d_model = transformer_d_model
         self.conv_hidden_dim = conv_hidden_dim
+        self.num_sym_tensor_products = num_sym_tensor_products
+        self.dropout = nn.Dropout(p=dropout)
         total_input_dim = 0
 
         for param in warp_parameters:
@@ -79,20 +81,28 @@ class TransformerMetric(nn.Module):
                 if pool:
                     output_size  = floor(dim / pool_size) ** 2
                 output_size *= conv_hidden_dim
-                total_input_dim += 2 * ceil(output_size / reduction_factor)
+                #total_input_dim += 2 * ceil(output_size / reduction_factor)
+                total_input_dim += 2 * output_size
 
                 mini_conv_block_1 = MiniConvBlock(param.in_size, param.in_channels, conv_hidden_dim, kernel_size=3, stride=1, padding=1, bias=True, pool=pool, pool_size=pool_size)
                 mini_conv_block_2 = MiniConvBlock(param.in_size, param.size(-2), conv_hidden_dim, kernel_size=3, stride=1, padding=1, bias=True, pool=pool, pool_size=pool_size)
+                """
                 linear_1 = nn.Linear(output_size, ceil(output_size / reduction_factor), bias = True)
                 linear_2 = nn.Linear(output_size, ceil(output_size / reduction_factor), bias = True)
                 in_module_1 = nn.Sequential(mini_conv_block_1, linear_1, nn.ReLU())
                 in_module_2 = nn.Sequential(mini_conv_block_2, linear_2, nn.ReLU())
                 self.input_modules.append(nn.ModuleList([in_module_1, in_module_2]))
+                """
+                self.input_modules.append(nn.ModuleList([mini_conv_block_1, mini_conv_block_2]))
             else:
+                """
                 total_input_dim += ceil(param.size(2) / reduction_factor) + ceil(param.size(1) / reduction_factor)
                 linear_1 = nn.Linear(param.size(2), ceil(param.size(2) / reduction_factor), bias = True)
                 linear_2 = nn.Linear(param.size(1), ceil(param.size(1) / reduction_factor), bias = True)
                 self.input_modules.append(nn.ModuleList([linear_1, linear_2]))
+                """
+                total_input_dim += param.size(2) + param.size(1)
+                self.input_modules.append(nn.ModuleList([nn.Identity(), nn.Identity()]))
 
         self.input_modules = nn.ModuleList(self.input_modules)
         self.input_linear = nn.Linear(total_input_dim, self.transformer_d_model, bias=True)
@@ -105,7 +115,7 @@ class TransformerMetric(nn.Module):
                 nn.TransformerEncoderLayer(self.transformer_d_model,
                                             self.transformer_heads,
                                             self.transformer_feedforward_dim,
-                                            dropout=0)
+                                            dropout=dropout)
             )
 
         self.transformer_encoder_layers = nn.ModuleList(self.transformer_encoder_layers)
@@ -121,6 +131,17 @@ class TransformerMetric(nn.Module):
                     total_input_shape.append(dimension)
             else:
                 total_input_shape.append(param.size(2))
+
+            total_input_shape_primes = []
+            """
+            for dimension in total_input_shape:
+                if dimension == 1:
+                    total_input_shape_primes.append(1)
+                else:
+                    for prime in primes(dimension):
+                        total_input_shape_primes.append(prime)
+            """
+
             self.input_shapes.append(total_input_shape)
 
             total_output_shape = []
@@ -129,20 +150,28 @@ class TransformerMetric(nn.Module):
                     total_output_shape.append(dimension)
             else:
                 total_output_shape.append(param.size(1))
+
+            """
+            total_output_shape_primes = []
+            for dimension in total_output_shape:
+                if dimension == 1:
+                    total_output_shape_primes.append(1)
+                else:
+                    for prime in primes(dimension):
+                        total_output_shape_primes.append(prime)
+            """
             self.output_shapes.append(total_output_shape)
 
             for dim in total_input_shape:
-                output_head_dim += (dim * (dim + 1)) // 2
+                output_head_dim += 2 * dim * num_sym_tensor_products
 
             for dim in total_output_shape:
-                output_head_dim += (dim * (dim + 1)) // 2
+                output_head_dim += 2 * dim * num_sym_tensor_products
 
         self.output_head = nn.Linear(self.transformer_d_model, output_head_dim, bias=True)
         with torch.no_grad():
-            self.output_head.weight /= 10000
-            self.output_head.bias /= 10000
-
-        import ipdb; ipdb.set_trace()
+            self.output_head.weight /= output_head_dim ** 2
+            self.output_head.bias /= output_head_dim ** 2
 
     def forward(self, warp_inputs: List[List[torch.Tensor]], state: List[List[torch.Tensor]] = None):
         embeddings = []
@@ -157,6 +186,7 @@ class TransformerMetric(nn.Module):
         embeddings = torch.cat(embeddings, dim=-1)
         embeddings = self.input_linear(embeddings)
         embeddings = self.relu(embeddings)
+        embeddings = self.dropout(embeddings)
         embeddings = embeddings.transpose(0,1)
 
         for i in range(self.transformer_layers):
@@ -164,6 +194,7 @@ class TransformerMetric(nn.Module):
             embeddings = self.layer_norms[i](embeddings)
 
         embeddings = embeddings.transpose(0,1)
+        embeddings = embeddings.sum(dim=-2)
 
         output_raw = self.output_head(embeddings)
         output_raw_size = output_raw.size()
@@ -173,33 +204,33 @@ class TransformerMetric(nn.Module):
         for i, param in enumerate(self.warp_parameters):
             output_matrices = []
             for dim in self.output_shapes[i]:
-                length = (dim * (dim + 1)) // 2
+                length =  2 * dim * self.num_sym_tensor_products
                 matrix_gen = output_raw[:, range_start : range_start + length]
-                range_start += length
-                matrix = torch.zeros(matrix_gen.size(0), dim, dim, device=matrix_gen.device)
-                triu_indices = torch.triu_indices(dim, dim, 1, device=matrix.device)
-                if triu_indices.size(-1) > 0:
-                    matrix[:, triu_indices[0], triu_indices[1]] = matrix_gen[:,:-dim]
-                    matrix[:, triu_indices[1], triu_indices[0]] = matrix_gen[:,:-dim]
-                eye_indices = torch.arange(0, dim, device=matrix.device, dtype=torch.long)
-                matrix[:, eye_indices, eye_indices] = matrix_gen[:,-dim:]
+                matrix_gen = matrix_gen.reshape(-1, 2 * dim)
+                matrix_gen_a = matrix_gen[:, : dim]
+                matrix_gen_b = matrix_gen[:, dim :]
+                ab = torch.bmm(matrix_gen_a.unsqueeze(-1), matrix_gen_b.unsqueeze(-2))
+                ba = torch.bmm(matrix_gen_b.unsqueeze(-1), matrix_gen_a.unsqueeze(-2))
+                matrix = 0.5 * (ab + ba)
+                matrix = matrix.reshape(output_raw.size(0), -1, dim, dim).sum(dim=-3)
                 matrix = matrix.reshape(list(output_raw_size)[:-1] + 2 * [dim])
                 output_matrices.append(matrix)
+                range_start += length
 
             input_matrices = []
             for dim in self.input_shapes[i]:
-                length = (dim * (dim + 1)) // 2
+                length =  2 * dim * self.num_sym_tensor_products
                 matrix_gen = output_raw[:, range_start : range_start + length]
-                range_start += length
-                matrix = torch.zeros(matrix_gen.size(0), dim, dim, device=matrix_gen.device)
-                triu_indices = torch.triu_indices(dim, dim, 1, device=matrix.device)
-                if triu_indices.size(-1) > 0:
-                    matrix[:, triu_indices[0], triu_indices[1]] = matrix_gen[:,:-dim]
-                    matrix[:, triu_indices[1], triu_indices[0]] = matrix_gen[:,:-dim]
-                eye_indices = torch.arange(0, dim, device=matrix.device, dtype=torch.long)
-                matrix[:, eye_indices, eye_indices] = matrix_gen[:,-dim:]
+                matrix_gen = matrix_gen.reshape(-1, 2 * dim)
+                matrix_gen_a = matrix_gen[:, : dim]
+                matrix_gen_b = matrix_gen[:, dim :]
+                ab = torch.bmm(matrix_gen_a.unsqueeze(-1), matrix_gen_b.unsqueeze(-2))
+                ba = torch.bmm(matrix_gen_b.unsqueeze(-1), matrix_gen_a.unsqueeze(-2))
+                matrix = 0.5 * (ab + ba)
+                matrix = matrix.reshape(output_raw.size(0), -1, dim, dim).sum(dim=-3)
                 matrix = matrix.reshape(list(output_raw_size)[:-1] + 2 * [dim])
                 input_matrices.append(matrix)
+                range_start += length
 
             kronecker_matrices.append([input_matrices, output_matrices])
         return kronecker_matrices

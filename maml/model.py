@@ -1,6 +1,6 @@
 import torch.nn as nn
 import torch
-from torch.nn import init
+from torch.nn import init, LayerNorm
 from torch.nn.functional import has_torch_function, handle_torch_function, assert_int_or_pair, _pair
 import math
 
@@ -34,24 +34,23 @@ class BatchParameter(nn.Parameter):
 
 class BatchLinear(MetaModule):
 
-    def __init__(self, input_size, output_size, meta_batch_size=1, bias=True, expanding=True, expanding_factor=32):
+    def __init__(self, input_size, output_size, meta_batch_size=1, bias=True, ensemble_size=0):
         super(BatchLinear, self).__init__()
 
         self.input_size = input_size
         self.output_size = output_size
         self.bias = bias
 
-        self.expanding = expanding
-        if expanding:
-            self.weight = BatchParameter(torch.Tensor(meta_batch_size // expanding_factor, self.output_size,
-                                                    input_size), expanding=True, expanding_factor=expanding_factor)
+        if ensemble_size != 0:
+            self.weight = BatchParameter(torch.Tensor(ensemble_size, self.output_size,
+                                                    input_size), expanding=True, expanding_factor=meta_batch_size)
             if bias:
-                self.bias_value = BatchParameter(torch.Tensor(meta_batch_size // expanding_factor, self.output_size, 1), collect_input=False, expanding=True)
+                self.bias_value = BatchParameter(torch.Tensor(ensemble_size, self.output_size, 1), collect_input=False, expanding=True, expanding_factor=meta_batch_size)
         else:
-            self.weight = BatchParameter(torch.Tensor(meta_batch_size, self.output_size,
-                                                    input_size))
+            self.weight = BatchParameter(torch.Tensor(1, self.output_size,
+                                                    input_size), expanding=True, expanding_factor=meta_batch_size)
             if bias:
-                self.bias_value = BatchParameter(torch.Tensor(meta_batch_size, self.output_size, 1), collect_input=False)
+                self.bias_value = BatchParameter(torch.Tensor(1, self.output_size, 1), collect_input=False, expanding=True, expanding_factor=meta_batch_size)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -64,16 +63,10 @@ class BatchLinear(MetaModule):
             init.uniform_(self.bias_value[:, :, 0], -bound, bound)
 
     def forward(self, input_data, params=None, save_warp_data=True):
-        if self.expanding:
-            weight = self.weight if params is None else params["weight"]
-        else:
-            weight = self.weight.expanded(input_data.size(0)) if params is None else params["weight"]
+        weight = self.weight.expanded(input_data.size(0)) if params is None else params["weight"]
 
         if self.bias:
-            if self.expanding:
-                bias_value = self.bias_value if params is None else params["bias_value"]
-            else:
-                bias_value = self.bias_value.expanded(input_data.size(0)) if params is None else params["bias_value"]
+            bias_value = self.bias_value.expanded(input_data.size(0)) if params is None else params["bias_value"]
 
             weight = torch.cat([weight, bias_value], dim=-1)
 
@@ -171,7 +164,7 @@ def unfold(input, kernel_size, dilation=1, padding=0, stride=1):
 
 class BatchConv2d(BatchLinear):
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size, stride = 1, padding = 0, dilation = 1, groups: int = 1, bias: bool = True, padding_mode: str = 'zeros', in_size=28, meta_batch_size=1, expanding=True, expanding_factor=32, out_division=None):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size, stride = 1, padding = 0, dilation = 1, groups: int = 1, bias: bool = True, padding_mode: str = 'zeros', in_size=28, meta_batch_size=1, ensemble_size=0, out_division=None):
         # Call grandparent
         super(BatchLinear, self).__init__()
 
@@ -184,6 +177,7 @@ class BatchConv2d(BatchLinear):
         self.groups = groups
         self.bias = bias
         self.padding_mode = padding_mode
+        self.ensemble_size = ensemble_size
 
         # self.linear = BatchLinear(self.in_channels * self.kernel_size[0] * self.kernel_size[1], out_channels, bias)
 
@@ -192,20 +186,19 @@ class BatchConv2d(BatchLinear):
 
         self.input_size = self.in_channels * total_kernel_size
         self.output_size = out_channels
-        self.expanding = expanding
         in_division = [self.in_channels, self.kernel_size[0], self.kernel_size[1]]
 
-        if expanding:
-            self.weight = BatchParameter(torch.Tensor(meta_batch_size // expanding_factor, self.output_size,
+        if self.ensemble_size != 0:
+            self.weight = BatchParameter(torch.Tensor(self.ensemble_size, self.output_size,
                                                     self.input_size), convolutional=True, in_size=in_size,
-                                                    in_channels=self.in_channels, expanding=True, expanding_factor=expanding_factor, in_division=in_division, out_division=out_division)
+                                                    in_channels=self.in_channels, expanding=True, expanding_factor=meta_batch_size, in_division=in_division, out_division=out_division)
             if bias:
-                self.bias_value = BatchParameter(torch.Tensor(meta_batch_size // expanding_factor, self.output_size, 1), collect_input=False, expanding=True)
+                self.bias_value = BatchParameter(torch.Tensor(self.ensemble_size, self.output_size, 1), collect_input=False, expanding=True, expanding_factor=meta_batch_size)
         else:
-            self.weight = BatchParameter(torch.Tensor(meta_batch_size, self.output_size,
-                                                    self.input_size), convolutional=True, in_size=in_size, in_channels=self.in_channels, in_division=in_division, out_division=out_division)
+            self.weight = BatchParameter(torch.Tensor(1, self.output_size,
+                                                    self.input_size), convolutional=True, in_size=in_size, in_channels=self.in_channels, expanding=True, expanding_factor=meta_batch_size, in_division=in_division, out_division=out_division)
             if bias:
-                self.bias_value = BatchParameter(torch.Tensor(meta_batch_size, self.output_size, 1), collect_input=False)
+                self.bias_value = BatchParameter(torch.Tensor(1, self.output_size, 1), expanding=True, expanding_factor=meta_batch_size, collect_input=False)
         self.reset_parameters()
 
     def forward(self, inputs, params = None):
@@ -293,7 +286,7 @@ class MetaConvModel(MetaModule):
            for Fast Adaptation of Deep Networks. International Conference on
            Machine Learning (ICML) (https://arxiv.org/abs/1703.03400)
     """
-    def __init__(self, in_channels, out_features, hidden_size=64, feature_size=64, in_size=28, meta_batch_size=1, hidden_division=None):
+    def __init__(self, in_channels, out_features, hidden_size=64, feature_size=64, in_size=28, meta_batch_size=1, hidden_division=None, ensemble_size=0, classifier=True):
         super(MetaConvModel, self).__init__()
         self.in_channels = in_channels
         self.out_features = out_features
@@ -306,21 +299,67 @@ class MetaConvModel(MetaModule):
 
         self.features = MetaSequential(OrderedDict([
             ('layer1', conv_block(in_channels, hidden_size, kernel_size=3,
-                                  stride=1, padding=1, bias=True, in_size=in_sizes[0]**2, meta_batch_size=meta_batch_size, out_division=hidden_division)),
+                                  stride=1, padding=1, bias=True, in_size=in_sizes[0]**2, meta_batch_size=meta_batch_size, out_division=hidden_division, ensemble_size=ensemble_size)),
             ('layer2', conv_block(hidden_size, hidden_size, kernel_size=3,
-                                  stride=1, padding=1, bias=True, in_size=in_sizes[1]**2, meta_batch_size=meta_batch_size, out_division=hidden_division)),
+                                  stride=1, padding=1, bias=True, in_size=in_sizes[1]**2, meta_batch_size=meta_batch_size, out_division=hidden_division, ensemble_size=ensemble_size)),
             ('layer3', conv_block(hidden_size, hidden_size, kernel_size=3,
-                                  stride=1, padding=1, bias=True, in_size=in_sizes[2]**2, meta_batch_size=meta_batch_size, out_division=hidden_division)),
+                                  stride=1, padding=1, bias=True, in_size=in_sizes[2]**2, meta_batch_size=meta_batch_size, out_division=hidden_division, ensemble_size=ensemble_size)),
             ('layer4', conv_block(hidden_size, hidden_size, kernel_size=3,
-                                  stride=1, padding=1, bias=True, in_size=in_sizes[3]**2, meta_batch_size=meta_batch_size, out_division=hidden_division))
+                                  stride=1, padding=1, bias=True, in_size=in_sizes[3]**2, meta_batch_size=meta_batch_size, out_division=hidden_division, ensemble_size=ensemble_size))
         ]))
-        self.classifier = BatchLinear(feature_size, out_features, bias=True, meta_batch_size=meta_batch_size)
+        self.classifier = None
+        if classifier:
+            self.classifier = BatchLinear(feature_size, out_features, bias=True, meta_batch_size=meta_batch_size, ensemble_size=ensemble_size)
 
     def forward(self, inputs, params=None):
         features = self.features(inputs, params=self.get_subdict(params, 'features'))
         features = features.view((features.size(0), features.size(1), -1))
-        logits = self.classifier(features, params=self.get_subdict(params, 'classifier'))
-        return logits
+        if self.classifier is not None:
+            features = self.classifier(features, params=self.get_subdict(params, 'classifier'))
+        return features
+
+class TransformerEnsembler(nn.Module):
+    def __init__(self, output_dim, hidden_size, transformer_layers: int = 6, transformer_heads: int = 8, transformer_feedforward_dim: int = 2048, transformer_d_model: int = 512):
+
+        super(TransformerEnsembler, self).__init__()
+
+        self.hidden_size = hidden_size
+        self.transformer_layers = transformer_layers
+        self.transformer_heads = transformer_heads
+        self.transformer_feedforward_dim = transformer_feedforward_dim
+        self.transformer_d_model = transformer_d_model
+
+        self.input_linear = nn.Linear(hidden_size, self.transformer_d_model, bias=True)
+        self.relu = nn.ReLU()
+        self.layer_norms = nn.ModuleList([LayerNorm(self.transformer_d_model) for _ in range(self.transformer_layers)])
+
+        self.transformer_encoder_layers = []
+        for _ in range(self.transformer_layers):
+            self.transformer_encoder_layers.append(
+                nn.TransformerEncoderLayer(self.transformer_d_model,
+                                            self.transformer_heads,
+                                            self.transformer_feedforward_dim,
+                                            dropout=0)
+            )
+
+        self.transformer_encoder_layers = nn.ModuleList(self.transformer_encoder_layers)
+
+        self.output_dim = output_dim
+        self.output_head = nn.Linear(self.transformer_d_model, output_dim, bias=True)
+
+    def forward(self, embeddings):
+        embeddings = self.input_linear(embeddings)
+        embeddings = self.relu(embeddings)
+        embeddings = embeddings.transpose(0,1)
+
+        for i in range(self.transformer_layers):
+            embeddings = self.transformer_encoder_layers[i](embeddings)
+            embeddings = self.layer_norms[i](embeddings)
+
+        embeddings = embeddings.transpose(0,1)
+
+        output = self.output_head(embeddings)
+        return output
 
 class MetaMLPModel(MetaModule):
     """Multi-layer Perceptron architecture from [1].
@@ -363,13 +402,13 @@ class MetaMLPModel(MetaModule):
         logits = self.classifier(features, params=self.get_subdict(params, 'classifier'))
         return logits
 
-def ModelConvOmniglot(out_features, hidden_size=64, meta_batch_size=1):
+def ModelConvOmniglot(out_features, hidden_size=64, meta_batch_size=1, ensemble_size=0):
     return MetaConvModel(1, out_features, hidden_size=hidden_size,
-                         feature_size=hidden_size, meta_batch_size=meta_batch_size)
+                         feature_size=hidden_size, meta_batch_size=meta_batch_size, ensemble_size=ensemble_size)
 
-def ModelConvMiniImagenet(out_features, hidden_size=64, meta_batch_size=1):
+def ModelConvMiniImagenet(out_features, hidden_size=64, meta_batch_size=1, ensemble_size=0):
     return MetaConvModel(3, out_features, hidden_size=hidden_size,
-                         feature_size=5 * 5 * hidden_size, in_size=84, meta_batch_size=meta_batch_size)
+                         feature_size=5 * 5 * hidden_size, in_size=84, meta_batch_size=meta_batch_size, ensemble_size=ensemble_size)
 
 def ModelMLPSinusoid(hidden_sizes=[40, 40], meta_batch_size=1):
     return MetaMLPModel(1, 1, hidden_sizes, meta_batch_size=meta_batch_size)

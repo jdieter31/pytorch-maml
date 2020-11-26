@@ -4,6 +4,7 @@ import os
 import time
 import json
 import logging
+import torch.nn as nn
 
 from torchmeta.utils.data import BatchMetaDataLoader
 
@@ -11,6 +12,7 @@ from maml.datasets import get_benchmark_by_name
 from maml.metalearners import ModelAgnosticMetaLearning
 from tqdm import tqdm
 from maml.utils import make_warp_model
+from maml.model import TransformerEnsembler
 import wandb
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -35,10 +37,10 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 
     def lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
-            return (float(current_step) / float(max(1, num_warmup_steps))) #* (0.5 + 0.5 * math.cos(phase_shift + 2 * math.pi * current_step / wavelength))
+            return (float(current_step) / float(max(1, num_warmup_steps))) * (0.5 + 0.5 * math.cos(phase_shift + 2 * math.pi * current_step / wavelength))
 
         return max(
-            0.0, (float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))) #* (0.5 + 0.5 * math.cos(phase_shift + 2 * math.pi * current_step / wavelength))
+            0.0, (float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))) * (0.5 + 0.5 * math.cos(phase_shift + 2 * math.pi * current_step / wavelength))
         )
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
@@ -127,13 +129,17 @@ def main(args):
         logging.info('Saving configuration file in `{0}`'.format(
                      os.path.abspath(os.path.join(folder, 'config.json'))))
 
+    ensemble_size = 0
+    if args.ensemble:
+        ensemble_size = args.ensemble_size
     benchmark = get_benchmark_by_name(args.dataset,
                                       args.folder,
                                       args.num_ways,
                                       args.num_shots,
                                       args.num_shots_test,
                                       hidden_size=args.hidden_size,
-                                      meta_batch_size=args.batch_size)
+                                      meta_batch_size=args.batch_size,
+                                      ensemble_size=ensemble_size)
 
     meta_train_dataloader = BatchMetaDataLoader(benchmark.meta_train_dataset,
                                                 batch_size=args.batch_size,
@@ -158,8 +164,18 @@ def main(args):
         meta_optimizer = torch.optim.Adam(benchmark.model.parameters(), lr=args.meta_lr)
         warp_meta_optimizer = None
 
-    warp_scheduler = None #get_linear_schedule_with_warmup(warp_meta_optimizer, 200, 100000, last_epoch=-1, phase_shift=-math.pi)
-    scheduler = None #get_linear_schedule_with_warmup(meta_optimizer, 200, 100000, last_epoch=-1)
+    if args.ensemble:
+        ensembler = nn.Identity() #TransformerEnsembler(args.num_ways, benchmark.model.feature_size)
+        ensembler_optimizer = None #torch.optim.Adam(ensembler.parameters(), lr=args.warp_lr)
+    else:
+        ensembler = None
+        ensembler_optimizer = None
+
+    warp_scheduler = get_linear_schedule_with_warmup(warp_meta_optimizer, 200, 100000, last_epoch=-1, phase_shift=-math.pi)
+    ensembler_scheduler = None #get_linear_schedule_with_warmup(ensembler_optimizer, 200, 100000, last_epoch=-1, phase_shift=-math.pi)
+
+
+    scheduler = get_linear_schedule_with_warmup(meta_optimizer, 200, 100000, last_epoch=-1)
 
     metalearner = ModelAgnosticMetaLearning(benchmark.model,
                                             meta_optimizer,
@@ -170,9 +186,14 @@ def main(args):
                                             first_order=args.first_order,
                                             num_adaptation_steps=args.num_steps,
                                             step_size=args.step_size,
+                                            learn_step_size=False,
                                             loss_function=benchmark.loss_function,
                                             device=device,
-                                            num_maml_steps=args.num_maml_steps)
+                                            num_maml_steps=args.num_maml_steps,
+                                            ensembler=ensembler,
+                                            ensembler_optimizer=ensembler_optimizer,
+                                            ensemble_size=ensemble_size,
+                                            ensembler_scheduler=ensembler_scheduler)
 
     best_value = None
 
@@ -243,27 +264,29 @@ if __name__ == '__main__':
         'updates (default: 1).')
     parser.add_argument('--num-epochs', type=int, default=200,
         help='Number of epochs of meta-training (default: 50).')
-    parser.add_argument('--num-batches', type=int, default=100,
+    parser.add_argument('--num-batches', type=int, default=300,
         help='Number of batch of tasks per epoch (default: 100).')
-    parser.add_argument('--num-eval-batches', type=int, default=100)
-    parser.add_argument('--step-size', type=float, default=0.1,
+    parser.add_argument('--num-eval-batches', type=int, default=50)
+    parser.add_argument('--step-size', type=float, default=0.001,
         help='Size of the fast adaptation step, ie. learning rate in the '
         'gradient descent update (default: 0.1).')
     parser.add_argument('--first-order', action='store_true',
         help='Use the first order approximation, do not use higher-order '
         'derivatives during meta-optimization.')
-    parser.add_argument('--meta-lr', type=float, default=0.0005,
+    parser.add_argument('--meta-lr', type=float, default=0.00001,
         help='Learning rate for the meta-optimizer (optimization of the outer '
         'loss). The default optimizer is Adam (default: 1e-4).')
-    parser.add_argument('--warp-lr', type=float, default=0.0005,
+    parser.add_argument('--warp-lr', type=float, default=0.00001,
         help='Learning rate for the meta-optimizer (optimization of the outer '
         'loss). The default optimizer is Adam (default: 1e-5).')
     parser.add_argument('--num-maml-steps', type=int, default=0,
         help='Number of steps to update initialization for before freezing it')
+    parser.add_argument('--ensemble-size', type=int, default=4)
 
     # Misc
     parser.add_argument('--num-workers', type=int, default=1,
         help='Number of workers to use for data-loading (default: 1).')
+    parser.add_argument('--ensemble', action='store_true')
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--use-cuda', action='store_true')
     parser.add_argument('--warp', action='store_true')

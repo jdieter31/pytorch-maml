@@ -72,6 +72,7 @@ def kronecker_warp(grad, kronecker_matrices) -> torch.Tensor:
     input_matrices = kronecker_matrices[0]
     output_matrices = kronecker_matrices[1]
     all_matrices = input_matrices + output_matrices
+    grad = grad.sum(dim=-3)
     grad_size = grad.size()
 
     first_matrix = all_matrices[0]
@@ -157,13 +158,13 @@ def gradient_update_parameters_warp(model,
 
             exp_input_matrices = []
             for matrix in input_matrices:
-                exp_matrix = torch.matrix_exp(-matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
+                exp_matrix = torch.matrix_exp(matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
                 exp_matrix = exp_matrix.reshape(matrix.size())
                 exp_input_matrices.append(exp_matrix)
 
             exp_output_matrices = []
             for matrix in output_matrices:
-                exp_matrix = torch.matrix_exp(-matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
+                exp_matrix = torch.matrix_exp(matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
                 exp_matrix = exp_matrix.reshape(matrix.size())
                 exp_output_matrices.append(exp_matrix)
 
@@ -175,12 +176,12 @@ def gradient_update_parameters_warp(model,
         for i, ((name, param), grad) in enumerate(zip(params.items(), param_jacobs)):
             if warp_model is not None:
                 grad = kronecker_warp(grad, kronecker_matrices[i])
-            updated_params[name] = param - step_size[name] * grad.mean(dim=-3)
+            updated_params[name] = param - step_size[name] * grad
 
     else:
         for i, ((name, param), grad) in enumerate(zip(params.items(), param_jacobs)):
             if warp_model is not None:
                 grad = kronecker_warp(grad, kronecker_matrices[i])
-            updated_params[name] = param - step_size * grad.mean(dim=-3)
+            updated_params[name] = param - step_size * grad
 
-    return updated_params, state
+    return updated_params
