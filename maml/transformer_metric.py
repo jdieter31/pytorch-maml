@@ -45,7 +45,7 @@ class MiniConvBlock(nn.Module):
 
 class TransformerMetric(nn.Module):
 
-    def __init__(self, warp_parameters, hidden_size: int = 64, transformer_layers: int = 1, transformer_heads: int = 8, transformer_feedforward_dim: int = 256, transformer_d_model: int = 64, conv_hidden_dim: int = 16, reduction_factor=4, num_sym_tensor_products = 16, dropout=0):
+    def __init__(self, warp_parameters, hidden_size: int = 64, transformer_layers: int = 3, transformer_heads: int = 8, transformer_feedforward_dim: int = 256, transformer_d_model: int = 64, conv_hidden_dim: int = 1, reduction_factor=4, num_sym_tensor_products = 6, dropout=0):
 
         super(TransformerMetric, self).__init__()
 
@@ -170,8 +170,27 @@ class TransformerMetric(nn.Module):
 
         self.output_head = nn.Linear(self.transformer_d_model, output_head_dim, bias=True)
         with torch.no_grad():
-            self.output_head.weight /= output_head_dim ** 2
-            self.output_head.bias /= output_head_dim ** 2
+            self.output_head.weight /= 100
+            #self.output_head.bias /= 100
+            """
+            # Initialize close to identity
+            eye = torch.zeros_like(self.output_head.bias)
+
+            range_start = 0
+            for i, param in enumerate(self.warp_parameters):
+                for dim in self.output_shapes[i]:
+                    length = (dim * (dim + 1)) // 2
+                    eye[range_start + length - dim : range_start + length].fill_(1)
+                    range_start += length
+
+                for dim in self.input_shapes[i]:
+                    length = (dim * (dim + 1)) // 2
+                    eye[range_start + length - dim : range_start + length].fill_(1)
+                    range_start += length
+
+            self.output_head.bias += eye
+            """
+
 
     def forward(self, warp_inputs: List[List[torch.Tensor]], state: List[List[torch.Tensor]] = None):
         embeddings = []
@@ -214,7 +233,9 @@ class TransformerMetric(nn.Module):
                 matrix = 0.5 * (ab + ba)
                 matrix = matrix.reshape(output_raw.size(0), -1, dim, dim).sum(dim=-3)
                 matrix = matrix.reshape(list(output_raw_size)[:-1] + 2 * [dim])
-                output_matrices.append(matrix)
+                exp_matrix = torch.matrix_exp(matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
+                exp_matrix = exp_matrix.reshape(matrix.size())
+                output_matrices.append(exp_matrix)
                 range_start += length
 
             input_matrices = []
@@ -229,10 +250,13 @@ class TransformerMetric(nn.Module):
                 matrix = 0.5 * (ab + ba)
                 matrix = matrix.reshape(output_raw.size(0), -1, dim, dim).sum(dim=-3)
                 matrix = matrix.reshape(list(output_raw_size)[:-1] + 2 * [dim])
-                input_matrices.append(matrix)
+                exp_matrix = torch.matrix_exp(matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
+                exp_matrix = exp_matrix.reshape(matrix.size())
+                input_matrices.append(exp_matrix)
                 range_start += length
 
             kronecker_matrices.append([input_matrices, output_matrices])
+
         return kronecker_matrices
 
     def set_listening(self, listening: bool):

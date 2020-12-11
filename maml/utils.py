@@ -4,6 +4,7 @@ from collections import OrderedDict
 from torchmeta.modules import MetaModule
 from .model import BatchParameter
 from .transformer_metric import TransformerMetric
+from .constant_metric import ConstantMetric
 
 from .expm import torch_expm as expm
 
@@ -43,7 +44,7 @@ class ToTensor1D(object):
     def __repr__(self):
         return self.__class__.__name__ + '()'
 
-def make_warp_model(model):
+def make_warp_model(model, constant=False):
     metric_params = []
     for parameter in model.parameters():
         if isinstance(parameter, BatchParameter):
@@ -54,7 +55,10 @@ def make_warp_model(model):
             metric_params.append(layer.weight)
     """
 
-    return TransformerMetric(metric_params)
+    if constant:
+        return ConstantMetric(metric_params)
+    else:
+        return TransformerMetric(metric_params)
 
 def kronecker_warp(grad, kronecker_matrices) -> torch.Tensor:
     """
@@ -158,15 +162,21 @@ def gradient_update_parameters_warp(model,
 
             exp_input_matrices = []
             for matrix in input_matrices:
-                exp_matrix = torch.matrix_exp(matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
-                exp_matrix = exp_matrix.reshape(matrix.size())
-                exp_input_matrices.append(exp_matrix)
+                #exp_matrix = torch.matrix_exp(matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
+                #exp_matrix = exp_matrix.reshape(matrix.size())
+                #exp_matrix = matrix.reshape((-1, matrix.size(-2), matrix.size(-1)))
+                #exp_matrix = torch.bmm(exp_matrix, exp_matrix)
+                #exp_matrix = exp_matrix.reshape(matrix.size())
+                exp_input_matrices.append(matrix)
 
             exp_output_matrices = []
             for matrix in output_matrices:
-                exp_matrix = torch.matrix_exp(matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
-                exp_matrix = exp_matrix.reshape(matrix.size())
-                exp_output_matrices.append(exp_matrix)
+                #exp_matrix = torch.matrix_exp(matrix.reshape((-1, matrix.size(-2), matrix.size(-1))))
+                #exp_matrix = exp_matrix.reshape(matrix.size())
+                #exp_matrix = matrix.reshape((-1, matrix.size(-2), matrix.size(-1)))
+                #exp_matrix = torch.bmm(exp_matrix, exp_matrix)
+                #exp_matrix = exp_matrix.reshape(matrix.size())
+                exp_output_matrices.append(matrix)
 
             kronecker_matrices.append([exp_input_matrices, exp_output_matrices])
 

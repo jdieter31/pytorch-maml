@@ -122,12 +122,15 @@ class ModelAgnosticMetaLearning(object):
         test_inputs = batch["test"][0]
         test_targets = batch["test"][1]
 
-        if self.ensembler is not None:
+        """
+        if self.ensembler is not None and not self.model.training:
             train_inputs = train_inputs.repeat_interleave(self.ensemble_size, dim=0)
             train_targets = train_targets.repeat_interleave(self.ensemble_size, dim=0)
             test_inputs = test_inputs.repeat_interleave(self.ensemble_size, dim=0)
+        """
 
-        if False:
+        if self.ensembler is not None and not self.model.training:
+            repeats = self.ensemble_size
             for i in range(repeats):
                 train_input_exp =  train_inputs[i * (train_inputs.size(0) // repeats) : (i+1) * (train_inputs.size(0) // repeats)].detach().repeat_interleave(repeats, dim=0)
                 train_target_exp =  train_targets[i * (train_inputs.size(0) // repeats) : (i+1) * (train_inputs.size(0) // repeats)].repeat_interleave(repeats, dim=0)
@@ -156,33 +159,38 @@ class ModelAgnosticMetaLearning(object):
             mean_outer_loss.div_(repeats)
             results['mean_outer_loss'] = mean_outer_loss.item()
 
-        params, adaptation_results = self.adapt(train_inputs, train_targets,
-            is_classification_task=is_classification_task,
-            num_adaptation_steps=self.num_adaptation_steps,
-            step_size=self.step_size, first_order=self.first_order, write_params=write_params)
+        else:
+            params, adaptation_results = self.adapt(train_inputs, train_targets,
+                is_classification_task=is_classification_task,
+                num_adaptation_steps=self.num_adaptation_steps,
+                step_size=self.step_size, first_order=self.first_order, write_params=write_params)
 
-        #results['inner_losses'][:] = adaptation_results['inner_losses']
-        if is_classification_task:
-            results['accuracies_before'] = adaptation_results['accuracy_before']
+            #results['inner_losses'][:] = adaptation_results['inner_losses']
+            if is_classification_task:
+                results['accuracies_before'] = adaptation_results['accuracy_before']
 
-        with torch.set_grad_enabled(self.model.training):
-            test_logits = self.model(test_inputs, params=params)
-            if self.ensembler is not None:
-                temp = test_logits
-                temp = temp.view(-1, self.ensemble_size, *temp.size()[1:])
-                temp = temp.transpose(0,1).reshape(self.ensemble_size, -1, temp.size(-1))
-                temp = self.ensembler(temp)
-                temp = temp.sum(dim=0)
-                test_logits = temp.view(test_logits.size(0) // self.ensemble_size, test_logits.size(1), -1)
+            with torch.set_grad_enabled(self.model.training):
+                if self.ensembler is not None and not self.model.training:
+                    test_logits = []
+                    for i in range(test_logits.size(0) // self.ensemble_size):
+                        test_logits.append(self.model(test_inputs[i * self.ensemble_size : (i + 1) * self.ensemble_size]))
 
-            outer_loss = self.loss_function(test_logits, test_targets)
-            mean_outer_loss += outer_loss
+                    temp = test_logits
+                    temp = temp.view(-1, self.ensemble_size, *temp.size()[1:])
+                    temp = temp.transpose(0,1).reshape(self.ensemble_size, -1, temp.size(-1))
+                    temp = self.ensembler(temp)
+                    temp = temp.sum(dim=0)
+                    test_logits = temp.view(test_logits.size(0) // self.ensemble_size, test_logits.size(1), -1)
+                else:
+                    test_logits = self.model(test_inputs, params=params)
+                outer_loss = self.loss_function(test_logits, test_targets)
+                mean_outer_loss += outer_loss
 
-        if is_classification_task:
-            results['accuracies_after'] = compute_accuracy(
-                test_logits, test_targets)
+            if is_classification_task:
+                results['accuracies_after'] = compute_accuracy(
+                    test_logits, test_targets)
 
-        results['mean_outer_loss'] = mean_outer_loss.item()
+            results['mean_outer_loss'] = mean_outer_loss.item()
 
         return mean_outer_loss, results
 
@@ -206,10 +214,7 @@ class ModelAgnosticMetaLearning(object):
             logits = self.model(inputs, params=params)
             inner_loss = self.loss_function(logits, targets, reduction="none")
 
-            if inner_loss.ndim > 2:
-                inner_loss = inner_loss.mean(dim=-1).sum(dim=0)
-            else:
-                inner_loss = inner_loss.sum(dim=0)
+            inner_loss = inner_loss.sum(dim=0)
 
             if (step == 0) and is_classification_task:
                 results['accuracy_before'] = compute_accuracy(logits, targets)

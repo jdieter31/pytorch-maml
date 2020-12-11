@@ -43,9 +43,9 @@ class BatchLinear(MetaModule):
 
         if ensemble_size != 0:
             self.weight = BatchParameter(torch.Tensor(ensemble_size, self.output_size,
-                                                    input_size), expanding=True, expanding_factor=meta_batch_size)
+                                                    input_size), expanding=False, expanding_factor=meta_batch_size)
             if bias:
-                self.bias_value = BatchParameter(torch.Tensor(ensemble_size, self.output_size, 1), collect_input=False, expanding=True, expanding_factor=meta_batch_size)
+                self.bias_value = BatchParameter(torch.Tensor(ensemble_size, self.output_size, 1), collect_input=False, expanding=False, expanding_factor=meta_batch_size)
         else:
             self.weight = BatchParameter(torch.Tensor(1, self.output_size,
                                                     input_size), expanding=True, expanding_factor=meta_batch_size)
@@ -164,7 +164,7 @@ def unfold(input, kernel_size, dilation=1, padding=0, stride=1):
 
 class BatchConv2d(BatchLinear):
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size, stride = 1, padding = 0, dilation = 1, groups: int = 1, bias: bool = True, padding_mode: str = 'zeros', in_size=28, meta_batch_size=1, ensemble_size=0, out_division=None):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size, stride = 1, padding = 0, dilation = 1, groups: int = 1, bias: bool = True, padding_mode: str = 'zeros', in_size=28, meta_batch_size=1, ensemble_size=0, out_division=None, ):
         # Call grandparent
         super(BatchLinear, self).__init__()
 
@@ -186,14 +186,14 @@ class BatchConv2d(BatchLinear):
 
         self.input_size = self.in_channels * total_kernel_size
         self.output_size = out_channels
-        in_division = [self.in_channels, self.kernel_size[0], self.kernel_size[1]]
+        in_division = [self.in_channels, self.kernel_size[0] * self.kernel_size[1]]
 
         if self.ensemble_size != 0:
             self.weight = BatchParameter(torch.Tensor(self.ensemble_size, self.output_size,
                                                     self.input_size), convolutional=True, in_size=in_size,
-                                                    in_channels=self.in_channels, expanding=True, expanding_factor=meta_batch_size, in_division=in_division, out_division=out_division)
+                                                    in_channels=self.in_channels, expanding=False, expanding_factor=meta_batch_size, in_division=in_division, out_division=out_division)
             if bias:
-                self.bias_value = BatchParameter(torch.Tensor(self.ensemble_size, self.output_size, 1), collect_input=False, expanding=True, expanding_factor=meta_batch_size)
+                self.bias_value = BatchParameter(torch.Tensor(self.ensemble_size, self.output_size, 1), collect_input=False, expanding=False, expanding_factor=meta_batch_size)
         else:
             self.weight = BatchParameter(torch.Tensor(1, self.output_size,
                                                     self.input_size), convolutional=True, in_size=in_size, in_channels=self.in_channels, expanding=True, expanding_factor=meta_batch_size, in_division=in_division, out_division=out_division)

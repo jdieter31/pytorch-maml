@@ -14,8 +14,8 @@ Benchmark = namedtuple('Benchmark', 'meta_train_dataset meta_val_dataset '
 
 def batch_cross_entropy(inputs, target, weight=None, size_average=None,
         ignore_index=-100, reduce=None, reduction='mean'):
-    loss = F.cross_entropy(inputs.reshape(-1, inputs.size(-1)), target.view(-1), weight, size_average, ignore_index, reduce, reduction)
-    if loss.ndim > 0:
+    loss = F.cross_entropy(inputs.reshape(-1, inputs.size(-1)), target.reshape(-1), weight, size_average, ignore_index, reduce, reduction)
+    if reduction == "none":
         return loss.reshape(inputs.size()[:-1])
     else:
         return loss
